@@ -1,0 +1,716 @@
+#!/usr/bin/env bash
+# Compact views and guarded actions over the native OpenCode session API (v2.2.5).
+# Responses are buffered to files: piping large `opencode api` output can truncate it.
+set -euo pipefail
+umask 077
+
+SELF=${OPENCODE_SESSION_ID:-}
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/oc-sessions.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+
+die() { echo "sessions: $*" >&2; exit 2; }
+api() { # api OUT OPERATION [ARGS...]
+  local out=$1
+  shift
+  if ! timeout 30 opencode api "$@" >"$out" 2>"$TMP/err"; then
+    echo "sessions: opencode api $1 failed (details withheld; may contain sensitive data)" >&2
+    return 1
+  fi
+}
+target() { # target ID [peer-ok]: load into $TMP/g.json; refuse self and, unless peer-ok, other coordinators
+  [[ $1 =~ ^ses_[A-Za-z0-9]+$ ]] || { echo "sessions: not a session ID: $1" >&2; return 1; }
+  [[ -n $SELF && $1 == "$SELF" ]] && { echo "sessions: refusing to target this coordinator session ($1)" >&2; return 1; }
+  api "$TMP/g.json" session.get --param sessionID="$1" || return 1
+  if [[ ${2:-} != peer-ok && $(jq -r '.data.agent // ""' "$TMP/g.json") == opencode ]]; then
+    echo "sessions: $1 is another coordinator session; use --peer only if the user asked to direct it" >&2
+    return 1
+  fi
+}
+
+JQ='
+def clip($n): if length > $n then .[0:$n] + "…" else . end;
+def oneline: gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ");
+def redact:
+  gsub("(?i)(?<k>api[_-]?key|access[_-]?key|secret|token|passw(?:or)?d|pwd)(?<s>[\"'"'"']?\\s*[:=]\\s*[\"'"'"']?)[^\\s\"'"'"',;&]{4,}"; "\(.k)\(.s)<redacted>")
+  | gsub("(?i)(?<k>bearer|basic) +[A-Za-z0-9._~+/=-]{12,}"; "\(.k) <redacted>")
+  | gsub("://[^/\\s@]+@"; "://<redacted>@")
+  | gsub("(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,})"; "<redacted>");
+def txt($n): tostring | redact | oneline | clip($n);
+def ts: if . == null then "-" else (. / 1000 | floor | strflocaltime("%b %d %H:%M")) end;
+def home: if startswith($home) then "~" + .[($home | length):] else . end;
+def act: [.time.busy, .time.idle, .time.created] | map(. // 0) | max;
+def state($active):
+  if $active[.id] then "running"
+  elif (.time.busy // 0) > (.time.idle // 0) then "stalled"
+  else (.outcome // "new") end;
+def unseen: .time.idle != null and (.time.viewed // 0) < .time.idle;
+def flags($active): [
+  (if .id == $self then "SELF" else empty end),
+  (if unseen and ($active[.id] | not) then "unseen" else empty end),
+  (if .time.archived then "archived" else empty end),
+  (if .fork then "fork-of:\(.fork.sessionID)" else empty end),
+  (if .agent == "opencode" and .id != $self then "coordinator" else empty end)
+] | join(",");
+def model: if .model then "\(.model.providerID)/\(.model.id)\(if .model.variant then "#" + .model.variant else "" end)" else "-" end;
+'
+q() { jq --arg home "$HOME" --arg self "$SELF" "$@"; }
+
+cmd_recent() {
+  local hours=48 day="" match="" search="" agent="" archived=false max=40 kids=0 cur="" pages=0 json=0
+  while (($#)); do
+    case $1 in
+      --hours) hours=${2:-}; shift ;;
+      --match) match=${2:-}; shift ;;
+      --search) search=${2:-}; shift ;;
+      --agent) agent=${2:-}; shift ;;
+      --archived) archived=both ;;
+      --only-archived) archived=true ;;
+      --max) max=${2:-}; shift ;;
+      --kids) kids=1 ;;
+      --json) json=1 ;;
+      --day) day=${2:-}; shift ;;
+      *) die "recent: unknown option $1" ;;
+    esac
+    shift
+  done
+  [[ $hours =~ ^[0-9]+$ && $max =~ ^[0-9]+$ ]] || die "recent: --hours and --max take integers"
+  local cutoff=0 until=0 capped=0 n last label
+  if [[ -n $day ]]; then # local calendar day of last activity
+    case $day in
+      today) day=$(date +%F) ;;
+      yesterday) day=$(date -d yesterday +%F) ;;
+      *) [[ $day =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "recent: --day today|yesterday|YYYY-MM-DD" ;;
+    esac
+    cutoff=$(date -d "$day 00:00" +%s%3N)
+    until=$(date -d "$(date -d "$day +1 day" +%F) 00:00" +%s%3N)
+    label="last active on $(date -d "$day" '+%a %b %d')"
+  elif ((hours > 0)); then
+    cutoff=$(($(date +%s%3N) - hours * 3600000))
+    label="active in last ${hours}h"
+  else
+    label="all time"
+  fi
+  local args=(--param limit=100)
+  [[ $archived != both ]] && args+=(--param archived="$archived")
+  [[ -n $search ]] && args+=(--param search="$search")
+  : >"$TMP/rows.jsonl"
+  while :; do # newest-updated first; filters travel inside the cursor
+    if [[ -z $cur ]]; then api "$TMP/p.json" session.list "${args[@]}" || exit 1
+    else api "$TMP/p.json" session.list --param limit=100 --param cursor="$cur" || exit 1; fi
+    jq -c '.data[]' "$TMP/p.json" >>"$TMP/rows.jsonl"
+    pages=$((pages + 1))
+    read -r n last cur < <(jq -r '[(.data | length), (.data[-1].time.updated // 0), (.cursor.next // "")] | @tsv' "$TMP/p.json")
+    [[ $n == 0 || -z $cur ]] && break
+    ((last < cutoff)) && break
+    if ((pages >= 20)); then capped=1; break; fi
+  done
+  api "$TMP/active.json" session.active || exit 1
+  api "$TMP/info.json" server.info || exit 1
+  # A live run must not disappear merely because it started before the window.
+  q -r --slurpfile rows "$TMP/rows.jsonl" '.data | keys[] as $id
+    | select($rows | any(.id == $id) | not) | $id' "$TMP/active.json" | while read -r id; do
+    if api "$TMP/ap.json" session.get --param sessionID="$id"; then
+      jq -c '.data' "$TMP/ap.json" >>"$TMP/rows.jsonl"
+    else
+      echo "sessions: active session $id could not be inspected" >&2
+    fi
+  done
+  # Children active in the window whose parent was quieter: fetch those parents (bounded).
+  : >"$TMP/parents.jsonl"
+  q -r --argjson cutoff "$cutoff" --slurpfile active "$TMP/active.json" -s "$JQ"'[.[] | select(act >= $cutoff or $active[0].data[.id])] as $w | ($w | map(.id)) as $ids
+    | [$w[] | .parentID // empty] | unique | map(select(. as $p | $ids | index($p) | not)) | .[0:10][]' \
+    "$TMP/rows.jsonl" | while read -r pid; do
+    if api "$TMP/pp.json" session.get --param sessionID="$pid" 2>/dev/null; then jq -c '.data' "$TMP/pp.json" >>"$TMP/parents.jsonl"; fi
+  done
+  q -r -n --argjson cutoff "$cutoff" --argjson max "$max" --argjson kids "$kids" --argjson capped "$capped" --argjson json "$json" \
+    --argjson until "$until" --arg label "$label" --arg match "$match" --arg agent "$agent" --arg archived "$archived" \
+    --slurpfile rows "$TMP/rows.jsonl" --slurpfile parents "$TMP/parents.jsonl" \
+    --slurpfile act "$TMP/active.json" --slurpfile info "$TMP/info.json" "$JQ"'
+    def norm: ascii_downcase | gsub("[-_/.]+"; " ");
+    ($match | norm | split(" ") | map(select(. != ""))) as $terms
+    | ($terms | join(" ")) as $phrase
+    | def hit($s): ([$s.title, $s.location.directory, $s.agent] | map(. // "" | norm) | join(" ")) as $h
+        | ($terms | all(. as $t | $h | contains($t))) and ($agent == "" or $s.agent == $agent);
+    def score($s): ($s.title // "" | norm) as $t | ($s.location.directory // "" | norm) as $d
+      | (if $phrase != "" and ($t | contains($phrase)) then 3 else 0 end)
+        + (if $phrase != "" and ($d | contains($phrase)) then 3 else 0 end)
+        + (if $phrase != "" and ($terms | all(. as $x | $t | contains($x))) then 1 else 0 end);
+    ($act[0].data // {}) as $active
+    | [$rows[] | select(act >= $cutoff or $active[.id])
+        | select($archived == "both" or ($archived == "true") == (.time.archived != null))] as $w
+    | ($w | map(select(.parentID != null)) | group_by(.parentID) | map({key: .[0].parentID, value: .}) | from_entries) as $kidmap
+    | [$parents[] | select(.parentID == null and ($archived == "both" or ($archived == "true") == (.time.archived != null)))] as $extra
+    | ([$w[] | select(.parentID == null)] + $extra | unique_by(.id)) as $roots
+    | [ $roots[] | . as $r | ($kidmap[.id] // []) as $k
+        | select(hit($r) or ($k | any(hit(.))))
+        | {r: $r, k: $k, last: ([$r | act] + ($k | map(act)) | max), score: ([score($r)] + ($k | map(score(.))) | max)} ]
+    | map(select($until == 0 or .last < $until))
+    | sort_by(-.score, (if $json == 1 and ($active[.r.id] or (.k | any($active[.id]))) then 0 else 1 end), -.last) as $sel
+    | if $json == 1 then ($sel | map(select(.r.id != $self))) as $review
+        | {as_of: (now | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")), total: ($review | length), scan_capped: ($capped == 1),
+         unresolved_parent_groups: ([$w[] | .parentID // empty] | unique | map(. as $p | select($roots | any(.id == $p) | not)) | length),
+         active_count: ($active | length), self_excluded: $self, sessions: [$review[0:$max][] |
+          {id: .r.id, title: (.r.title // "" | txt(120)), directory: .r.location.directory,
+           subpath: .r.subpath, agent: .r.agent, selected_model: (.r | model),
+            last_activity: (.last | ts), last_activity_ms: .last,
+            run_started_at: (.r.time.busy | ts), run_started_ms: .r.time.busy,
+           execution: (.r | state($active)), flags: (.r | flags($active)),
+            cost_usd_reported: .r.cost, children_in_window: (.k | length),
+            children: [.k | sort_by((if $active[.id] then 0 else 1 end), -act)[0:12][] | {id, agent, execution: state($active)}]}]}
+      else "# \($info[0] | "server \(.hostname) v\(.version) pid \(.pid)") · now \(now | strflocaltime("%a %b %d %H:%M")) · "
+      + $label + (if $phrase != "" then " · ranked by match strength" else "" end)
+      + " · \($sel | length) roots, \($sel | map(.k | length) | add // 0) children · running \($active | keys | length) · self \(if $self == "" then "none" else $self end)",
+      ( $sel[0:$max][] | .r as $r | .k as $k
+        | ($k | map(state($active)) | group_by(.) | map("\(length) \(.[0])") | join(" ")) as $ks
+        | "\($r.id)  \(.last | ts)  \($r | state($active))  \($r.agent // "-")  \($r.location.directory | home)  \($r.title // "(untitled)" | txt(80))"
+          + (if ($k | length) > 0 then "  [kids: \($ks)]" else "" end)
+          + ($r | flags($active) | if . != "" then "  {\(.)}" else "" end),
+          ( if $kids == 1 then $k | sort_by(-act)[0:12][]
+              | "    └ \(.id)  \(act | ts)  \(state($active))  \(.agent // "-")  \(.title // "" | txt(70))" + (flags($active) | if . != "" then "  {\(.)}" else "" end)
+            else empty end ) ),
+      (if ($sel | length) > $max then "# +\(($sel | length) - $max) more roots (raise --max or narrow --match)" else empty end),
+      (if $capped == 1 then "# scan capped at 2000 sessions; narrow --hours or use --search" else empty end)
+      end
+  '
+}
+
+cmd_show() {
+  local id=${1:-}
+  [[ $id =~ ^ses_[A-Za-z0-9]+$ ]] || die "usage: show ID"
+  api "$TMP/s.json" session.get --param sessionID="$id" || exit 1
+  api "$TMP/active.json" session.active || exit 1
+  api "$TMP/inbox.json" session.inbox.list --param sessionID="$id" || exit 1
+  api "$TMP/kids.json" session.list --param parentID="$id" --param limit=100 || exit 1
+  api "$TMP/perm.json" session.permission.list --param sessionID="$id" || exit 1
+  api "$TMP/form.json" session.form.list --param sessionID="$id" || exit 1
+  q -r -n --slurpfile s "$TMP/s.json" --slurpfile act "$TMP/active.json" --slurpfile inbox "$TMP/inbox.json" \
+    --slurpfile kids "$TMP/kids.json" --slurpfile perm "$TMP/perm.json" --slurpfile form "$TMP/form.json" "$JQ"'
+    ($act[0].data // {}) as $active | $s[0].data as $x
+    | "\($x.id)  \($x.title // "(untitled)" | txt(120))",
+      "  \($x.location.directory | home)\(if $x.subpath then "/" + $x.subpath else "" end) · agent \($x.agent // "-") · model \($x | model)",
+      "  state \($x | state($active))\(if ($x | unseen) then " (unseen)" else "" end) · created \($x.time.created | ts) · last run \($x.time.busy | ts) → \($x.time.idle | ts)",
+      ( [ (if $x.id == $self then "THIS COORDINATOR SESSION" else empty end),
+          (if $x.agent == "opencode" and $x.id != $self then "another coordinator session" else empty end),
+          (if $x.parentID then "child of \($x.parentID)" else empty end),
+          (if $x.fork then "fork of \($x.fork.sessionID) (\($x.fork.boundary.type) \($x.fork.boundary.messageID))" else empty end),
+          (if $x.time.archived then "archived \($x.time.archived | ts)" else empty end) ]
+        | select(length > 0) | "  " + join(" · ") ),
+      ( $inbox[0].data | if length == 0 then "  inbox: empty"
+        else "  inbox \(length): " + (map("[\(.delivery) \(.type)] \(.payload.text // .payload.description // "" | txt(100))") | join("; ")) end ),
+      ( ($perm[0].data // []) as $p | ($form[0].data // []) as $f
+        | select(($p | length) + ($f | length) > 0)
+        | "  waiting on user: \($p | length) permission request(s)\($p | map(" [\(.action // .type // "?") \(.resources // .patterns // [] | txt(80))]") | join(""))"
+          + ", \($f | length) form(s)\($f | map(" [\(.title // .id | txt(80))]") | join(""))" ),
+      ( $kids[0].data | select(length > 0)
+        | "  children \(length)\(if length >= 100 then "+" else "" end):",
+          (sort_by(-act)[0:8][] | "    \(.id)  \(act | ts)  \(state($active))  \(.agent // "-")  \(.title // "" | txt(70))") )
+  '
+}
+
+review_fetch() { # Cache bounded evidence; no model call or session mutation.
+  local id=$1 cache=$2 limit=$3 op child
+    for op in inbox permission form; do
+      if ! api "$cache/$op.json" "session.$op.list" --param sessionID="$id"; then
+        echo '{"data":null}' >"$cache/$op.json"
+      fi
+    done
+    : >"$cache/child-pending.jsonl"
+    while read -r child; do
+      for op in permission form; do
+        if ! api "$cache/child-$op.json" "session.$op.list" --param sessionID="$child"; then
+          echo '{"data":null}' >"$cache/child-$op.json"
+        fi
+      done
+      jq -cn --arg id "$child" --slurpfile p "$cache/child-permission.json" --slurpfile f "$cache/child-form.json" '
+        def count: if .data == null then null else (.data | length) end;
+        {session: $id, permissions: ($p[0] | count), forms: ($f[0] | count)}' >>"$cache/child-pending.jsonl"
+    done < <(jq -r '[.children[] | select(.execution == "running")][0:8][].id' "$cache/row.json")
+    if ! api "$cache/latest.json" session.message.list --param sessionID="$id" --param type=assistant --param order=desc --param limit="$limit"; then
+      echo '{"data":[],"unavailable":true}' >"$cache/latest.json"
+    fi
+    if ! api "$cache/user.json" session.message.list --param sessionID="$id" --param type=user --param order=desc --param limit=1; then
+      echo '{"data":[],"unavailable":true}' >"$cache/user.json"
+    fi
+}
+
+review_row() {
+    local cache=$1
+    q -c -n --slurpfile row "$cache/row.json" --slurpfile a "$cache/latest.json" --slurpfile u "$cache/user.json" \
+      --slurpfile models "$TMP/models.json" --slurpfile inbox "$cache/inbox.json" \
+      --slurpfile p "$cache/permission.json" --slurpfile f "$cache/form.json" --slurpfile child "$cache/child-pending.jsonl" "$JQ"'
+      def ts: if . == null then "-" else (. / 1000 | floor | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")) end;
+      $row[0] as $r | ($a[0].data[0] // {}) as $last
+      | ([$a[0].data[] | select((.tokens.input // 0) + (.tokens.cache.read // 0) + (.tokens.cache.write // 0) > 0)][0] // {}) as $step
+      | ([$a[0].data[] | select(any(.content[]?; .type == "text" and .text != ""))][0] // {}) as $said
+      | ([$models[0].data[] | select(.id == $step.model.id and .providerID == $step.model.providerID)][0].limit // {}) as $limit
+      | ($step.tokens // {}) as $t
+      | (if $step.tokens then (($t.input // 0) + ($t.cache.read // 0) + ($t.cache.write // 0)) else null end
+          | if . != null and . > 0 then . else null end) as $used
+      | (if $r.execution == "unknown" or $p[0].data == null or $f[0].data == null or $inbox[0].data == null or ($child | any(.permissions == null or .forms == null)) then "unknown"
+         elif ($p[0].data | length) + ($f[0].data | length) > 0 or ($child | any(.permissions > 0 or .forms > 0)) then "needs-user"
+         elif ($inbox[0].data | length) > 0 then "queued"
+         elif $r.execution == "running" or ($r.children | any(.execution == "running")) then "running"
+         elif (["failed", "stalled", "interrupted"] | index($r.execution)) then "inspect-error"
+         elif ($said.time.created // 0) < ($u[0].data[0].time.created // 0) then "unanswered"
+         elif ($r.flags | contains("unseen")) then "unseen"
+         else "idle-review" end) as $attention
+      | $r + {attention: $attention,
+          last_activity: ($r.last_activity_ms | ts), run_started_at: ($r.run_started_ms | ts),
+          user_request: ($u[0].data[0].text // "" | txt(500)),
+          reply: ([$said.content[]? | select(.type == "text") | .text] | join(" ") | txt(1200)),
+          history_check: (if $a[0].unavailable or $u[0].unavailable then "unavailable" else "bounded latest messages" end),
+          user_request_at: ($u[0].data[0].time.created | ts),
+          reply_at: ($said.time.created | ts), reply_message_id: $said.id, reply_is_final: ($said.finish == "stop"),
+          reply_predates_request: (($said.time.created // 0) < ($u[0].data[0].time.created // 0)),
+          last_used_model: ($last | model),
+          last_progress_at: ([$a[0].data[] | .time | .created, .streamed, .completed] | map(select(. != null)) | max | ts),
+          last_progress_ms: ([$a[0].data[] | .time | .created, .streamed, .completed] | map(select(. != null)) | max),
+          current_tools: ([$last.content[]? | select(.type == "tool" and (.state.status == "running" or .state.status == "pending")) | {name, status: .state.status}][0:4]),
+          context: {estimate: $used, capacity: $limit.context, input_limit: $limit.input,
+            percent: (if $used != null and ($limit.context // 0) > 0 then (100 * $used / $limit.context | round) else null end),
+            input_percent: (if $used != null and ($limit.input // 0) > 0 then (100 * $used / $limit.input | round) else null end),
+            input_headroom_estimate: (if $used != null and ($limit.input // 0) > 0 then $limit.input - $used else null end),
+            input_warning: ($used != null and ($limit.input // 0) > 0 and $used >= 0.8 * $limit.input),
+            message_id: $step.id,
+            model: ($step | model), measured_at: ($step.time.created | ts),
+            note: "Last reported request input+cache read+write; estimate, not live or cumulative usage"},
+          error: ($last.error.message // $last.retry.error.message // "" | txt(180)),
+          retry_at: ($last.retry.at | ts), finish: $last.finish,
+          inbox_count: (if $inbox[0].data != null then ($inbox[0].data | length) else null end),
+          permissions: (if $p[0].data != null then [$p[0].data[] | {action, resources: (.resources | map(txt(100)))}] else null end),
+          forms: (if $f[0].data != null then [$f[0].data[] | {id, title: (.title | txt(100))}] else null end),
+          child_blockers: $child, children_not_inspected: ($r.children_in_window - ($child | length)),
+          child_coverage: "Pending input checked on at most eight live children; other children not qualified",
+          work_completion: "unknown; assess the session-reported reply, not the execution outcome",
+          work_status: {state: (if $attention == "needs-user" then "needs-your-decision"
+            elif $attention == "running" or $attention == "queued" or $attention == "unanswered" then "unfinished" else "unknown" end),
+            basis: "Native pending input/live execution only; interpret current replies separately. Publication alone is not whole-task completion."},
+          publication: "not checked; use delivery with a session-attributed branch/commit",
+          cleanup: "not checked",
+          next_action: (if $attention == "needs-user" then "Answer the permission/form in the client"
+            elif $attention == "running" then "Leave running; inspect active children if attention is needed"
+            elif $attention == "inspect-error" then "Inspect show/tail before proposing continuation"
+            elif $attention == "unknown" then "Inspection incomplete; retry read-only inspection before acting"
+            elif $attention == "queued" then "An instruction is already queued; inspect inbox before proposing another"
+            else "Read the reply for completion or an open decision; do not resume automatically" end)}
+    '
+}
+
+review_metadata() {
+  local id=$1 cache=$2
+  if ! api "$cache/session.json" session.get --param sessionID="$id"; then
+    jq '.execution="unknown" | .refresh="unavailable"' "$cache/row.json" >"$cache/new-row.json"
+  else
+    q --slurpfile row "$cache/row.json" --slurpfile active "$TMP/review-active.json" "$JQ"'
+      .data as $s | ($active[0].data // {}) as $active
+      | $row[0] + {execution: ($s | state($active)), flags: ($s | flags($active)),
+          selected_model: ($s | model), directory: $s.location.directory, subpath: $s.subpath,
+          run_started_at: ($s.time.busy | ts), run_started_ms: $s.time.busy,
+          last_activity: ([$s | act, $row[0].last_activity_ms] | max | ts),
+          last_activity_ms: ([$s | act, $row[0].last_activity_ms] | max), refresh: "refreshed",
+          children: [$row[0].children[] | .execution = (if $active[.id] then "running"
+            elif .execution == "running" then "unknown-ended" else .execution end)]}
+    ' "$cache/session.json" >"$cache/new-row.json"
+  fi
+  mv "$cache/new-row.json" "$cache/row.json"
+}
+
+cmd_review() {
+  local hours=48 match="" max=10 scan_max=50 id cache
+  while (($#)); do
+    case $1 in
+      --hours) hours=${2:-}; shift ;;
+      --match) match=${2:-}; shift ;;
+      --max) max=${2:-}; shift ;;
+      --scan-max) scan_max=${2:-}; shift ;;
+      *) die "review: unknown option $1" ;;
+    esac
+    shift
+  done
+  [[ $max =~ ^[0-9]+$ ]] && ((max >= 1 && max <= 30)) || die "review: --max 1-30"
+  [[ $scan_max =~ ^[0-9]+$ ]] && ((scan_max >= max && scan_max <= 200)) || die "review: --scan-max must be --max through 200"
+  cmd_recent --hours "$hours" --match "$match" --max "$scan_max" --json >"$TMP/discovery.json"
+  if api "$TMP/models-raw.json" model.list; then
+    jq '{data: [.data[] | {id, providerID, limit}]}' "$TMP/models-raw.json" >"$TMP/models.json"
+  else
+    echo '{"data":[]}' >"$TMP/models.json"
+  fi
+  : >"$TMP/scan.jsonl"
+  while read -r id; do
+    [[ $id =~ ^ses_[A-Za-z0-9]+$ ]] || die "review: invalid session ID in discovery"
+    cache="$TMP/$id"
+    mkdir "$cache"
+    jq --arg id "$id" '.sessions[] | select(.id == $id)' "$TMP/discovery.json" >"$cache/row.json"
+    review_fetch "$id" "$cache" 1
+    review_row "$cache" >>"$TMP/scan.jsonl"
+  done < <(jq -r '.sessions[].id' "$TMP/discovery.json")
+  local ranking='sort_by((.attention as $a | ["needs-user","unknown","inspect-error","queued","running","unanswered","unseen","idle-review"] | index($a)), -.last_activity_ms)'
+  jq -s --argjson max "$max" "$ranking | .[0:\$max] | map(.id)" "$TMP/scan.jsonl" >"$TMP/selected.json"
+  : >"$TMP/details.jsonl"
+  while read -r id; do
+    cache="$TMP/$id"
+    if ! api "$cache/latest.json" session.message.list --param sessionID="$id" --param type=assistant --param order=desc --param limit=8; then
+      echo '{"data":[],"unavailable":true}' >"$cache/latest.json"
+    fi
+    review_row "$cache" >>"$TMP/details.jsonl"
+  done < <(jq -r '.[]' "$TMP/selected.json")
+  # One final bounded refresh, not a poller. Keep incomplete refresh evidence explicit.
+  api "$TMP/review-active.json" session.active || return 1
+  : >"$TMP/review.jsonl"
+  while read -r id; do
+    cache="$TMP/$id"
+    if jq -e --arg id "$id" --slurpfile rows "$TMP/details.jsonl" '
+      .data as $active | $rows[] | select(.id == $id)
+      | .attention != "idle-review" and .attention != "unseen"
+        or (($active[$id] != null) != (.execution == "running"))
+        or any(.children[]; (($active[.id] != null) != (.execution == "running")))
+      ' "$TMP/review-active.json" >/dev/null; then
+      review_metadata "$id" "$cache"
+      review_fetch "$id" "$cache" 8
+    fi
+    review_row "$cache" >>"$TMP/review.jsonl"
+  done < <(jq -r '.[]' "$TMP/selected.json")
+  q -n --slurpfile discovery "$TMP/discovery.json" --slurpfile rows "$TMP/review.jsonl" \
+    --slurpfile scan "$TMP/scan.jsonl" --slurpfile selected "$TMP/selected.json" --slurpfile active "$TMP/review-active.json" "$JQ"'
+    $discovery[0] | {as_of: (now | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")), scan_started_at: .as_of,
+      active_count_including_self_and_children: ($active[0].data | length), self_excluded, discovered_roots: .total,
+      unresolved_parent_groups,
+      blocker_scanned_roots: ($scan | length), unscanned_roots: (.total - ($scan | length)),
+      inspected_roots: ($rows | length), scan_capped, refreshed_roots: ([$rows[] | select(.refresh == "refreshed")] | length),
+      refresh_failed_roots: ([$rows[] | select(.refresh == "unavailable")] | length),
+      omitted_roots: (.total - ($rows | length)),
+      coverage: "Bounded triage, then detailed selection and one final refresh. Not atomic. SELF excluded; unscanned sessions and unchecked children are not qualified.",
+      triage: [$scan[] | select(.id as $id | $selected[0] | index($id) | not)
+        | {id, title, directory, execution, attention, user_request: (.user_request | txt(160)),
+           reply: (.reply | txt(400)), reply_message_id, reply_is_final, reply_predates_request, last_activity, last_progress_at, work_status,
+           selected_model, last_used_model,
+           context: (.context | {estimate, input_limit, input_percent, capacity, model, measured_at, input_warning}),
+           preview_incomplete: (.history_check == "unavailable" or .reply == "" or (.reply | length) > 400),
+           freshness: "Triage snapshot only; not refreshed"}],
+      sessions: ($rows | sort_by((.attention as $a | ["needs-user","unknown","inspect-error","queued","running","unanswered","unseen","idle-review"] | index($a)), -.last_activity_ms))}
+    | walk(if type == "string" then redact else . end)
+  '
+}
+
+cmd_delivery() {
+  local id=${1:-} branch="" commit="" remote=origin dir="" session_dir evidence="" relation=native-session-location
+  local url="" head="" local_ref=unknown remote_ref=unknown pushed=unknown attribution=current-checkout
+  [[ $id =~ ^ses_[A-Za-z0-9]+$ ]] || die "usage: delivery ID [--branch NAME] [--commit SHA] [--remote NAME] [--directory /abs] [--evidence-message ID]"
+  shift
+  while (($#)); do
+    case $1 in
+      --branch) branch=${2:-}; shift; attribution=session-branch-provided ;;
+      --commit) commit=${2:-}; shift ;;
+      --remote) remote=${2:-}; shift ;;
+      --directory) dir=${2:-}; shift ;;
+      --evidence-message) evidence=${2:-}; shift ;;
+      *) die "delivery: unknown option $1" ;;
+    esac
+    shift
+  done
+  [[ -z $commit || $commit =~ ^[0-9a-fA-F]{7,40}$ ]] || die "delivery: commit must be a SHA"
+  [[ $remote =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "delivery: invalid remote name"
+  [[ $branch != -* ]] || die "delivery: invalid branch"
+  [[ -z $branch ]] || git check-ref-format "refs/heads/$branch" >/dev/null 2>&1 || die "delivery: invalid branch"
+  [[ -z $dir || $dir == /* ]] || die "delivery: directory must be absolute"
+  [[ -z $evidence || $evidence =~ ^msg_[A-Za-z0-9]+$ ]] || die "delivery: invalid evidence message ID"
+  api "$TMP/ds.json" session.get --param sessionID="$id" || return 1
+  session_dir=$(jq -r '.data | .location.directory + (if .subpath then "/" + .subpath else "" end)' "$TMP/ds.json")
+  if [[ -z $dir ]]; then dir=$session_dir; else relation=unverified-override; fi
+  if [[ -n $evidence ]] && api "$TMP/delivery-evidence.json" session.message.get --param sessionID="$id" --param messageID="$evidence"; then
+    relation=$(jq -r --arg dir "$dir" '
+      def edge: . == "" or (explode[0] as $c | [9,10,13,32,34,39,40,41,44,58,59,91,93,96,123,125] | index($c) != null);
+      def mentions($dir): . as $text | any(indices($dir)[]; . as $i
+        | ((if $i == 0 then "" else $text[($i-1):$i] end) | edge)
+          and ($text[($i+($dir|length)):($i+($dir|length)+1)] | edge));
+      .data | if .type == "assistant" and any(.content[]?;
+          .type == "tool" and .name == "shell" and .state.status == "completed" and .state.input.workdir == $dir)
+        then "recorded-tool-workdir"
+        elif ([.text // "", (.content[]? | select(.type == "text") | .text)] | any(mentions($dir)))
+        then "session-reported-path" else "unverified-override" end' "$TMP/delivery-evidence.json")
+  fi
+  if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+    q -n --arg session_dir "$session_dir" --arg dir "$dir" --arg relation "$relation" "$JQ"'
+      {repository: "unavailable; publication and cleanup unknown", session_directory: $session_dir,
+       work_directory: $dir, checkout_relation: $relation} | walk(if type == "string" then redact else . end)'
+    return
+  fi
+  [[ -n $branch ]] || branch=$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || true)
+  git --no-optional-locks -C "$dir" status --porcelain --untracked-files=normal >"$TMP/status" 2>/dev/null || return 1
+  git -C "$dir" worktree list --porcelain >"$TMP/worktrees" 2>/dev/null || return 1
+  head=$(git -C "$dir" rev-parse --verify HEAD 2>/dev/null || true)
+  # Strip userinfo, query and fragment; never emit git's raw configured URL.
+  url=$(git -C "$dir" remote get-url "$remote" 2>/dev/null | jq -Rr '
+    try (capture("^(?:https?://(?:[^/@]*@)?|ssh://(?:[^/@]*@)?|[^/@:]+@)(?<host>[A-Za-z0-9.-]+)(?::[0-9]+)?[:/](?<path>[A-Za-z0-9._/-]+?)(?:\\.git)?(?:[?#].*)?$")
+      | "https://" + .host + "/" + (.path | rtrimstr(".git"))) catch ""' || true)
+  echo '[]' >"$TMP/prs.json"
+  local pr_status=not-checked worktree_count=unknown local_commit=not-requested
+  if [[ -n $commit ]]; then
+    local_commit=not-found
+    if git -C "$dir" rev-parse --verify "$commit^{commit}" >"$TMP/commit" 2>/dev/null; then
+      commit=$(cat "$TMP/commit")
+      local_commit=present
+    fi
+  fi
+  if [[ -n $branch ]]; then
+    local_ref=absent
+    if git -C "$dir" show-ref --verify --quiet "refs/heads/$branch"; then local_ref=present; fi
+    worktree_count=$(awk -v ref="branch refs/heads/$branch" '$0 == ref {n++} END {print n+0}' "$TMP/worktrees")
+    if timeout 20 git -C "$dir" ls-remote --heads "$remote" "refs/heads/$branch" >"$TMP/remote-head" 2>/dev/null; then
+      remote_ref=absent
+      if [[ -s $TMP/remote-head ]]; then
+        remote_ref=present
+        local remote_sha
+        remote_sha=$(awk 'NR==1 {print $1}' "$TMP/remote-head")
+        if [[ -n $commit ]]; then
+          if [[ $remote_sha == "$commit" ]] || git -C "$dir" merge-base --is-ancestor "$commit" "$remote_sha" 2>/dev/null; then pushed=verified-on-remote-branch; fi
+        fi
+      fi
+    fi
+    if [[ $url == https://github.com/* ]] && command -v gh >/dev/null; then
+      if timeout 20 gh pr list --repo "${url#https://github.com/}" --head "$branch" --state all --limit 5 \
+          --json number,state,isDraft,url,headRefName,headRefOid,headRepository,mergedAt,updatedAt >"$TMP/prs.json" 2>/dev/null; then
+        pr_status=verified-now
+        # A matching branch name in another fork is not this remote.
+        jq --arg repo "${url#https://github.com/}" '[.[] | select((.headRepository.nameWithOwner // "" | ascii_downcase) == ($repo | ascii_downcase))]' "$TMP/prs.json" >"$TMP/matched-prs.json"
+        mv "$TMP/matched-prs.json" "$TMP/prs.json"
+        if [[ -n $commit ]] && jq -e --arg commit "$commit" 'any(.[]; .headRefOid == $commit)' "$TMP/prs.json" >/dev/null; then
+          pushed=verified-in-pr-head
+        fi
+      else
+        pr_status=unavailable
+        echo '[]' >"$TMP/prs.json"
+      fi
+    fi
+  fi
+  q -n --arg id "$id" --arg dir "$dir" --arg session_dir "$session_dir" --arg relation "$relation" --arg evidence "$evidence" --arg branch "$branch" --arg commit "$commit" --arg head "$head" \
+    --arg url "$url" --arg remote "$remote" --arg attribution "$attribution" --arg local_ref "$local_ref" --arg remote_ref "$remote_ref" \
+    --arg pushed "$pushed" --arg local_commit "$local_commit" --arg pr_status "$pr_status" --arg worktrees "$worktree_count" \
+    --rawfile status "$TMP/status" --slurpfile prs "$TMP/prs.json" "$JQ"'
+    {as_of: (now | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")), session: $id, directory: $dir,
+     session_directory: $session_dir, work_directory: $dir, checkout_relation: $relation, evidence_message: $evidence,
+     attribution: $attribution, branch: $branch, checkout_head: $head, dirty_entries: ($status | split("\n") | map(select(. != "")) | length),
+     remote: $remote, repository_url: $url, requested_commit: $commit, local_commit: $local_commit, pushed: $pushed,
+     commit_url: (if $commit != "" and $url != "" and $pushed != "unknown" then $url + "/commit/" + $commit else null end),
+     prs_check: $pr_status, prs: $prs[0], local_branch: $local_ref, remote_branch: $remote_ref,
+     pr_scope: "At most five PRs on the selected GitHub remote with matching source repository/branch; not an exhaustive cross-fork search",
+     worktrees_for_branch: $worktrees,
+     cleanup: "Presence verified where available; absence does not prove this session deleted anything. No fetch/prune/cleanup performed."}
+    | walk(if type == "string" then redact else . end)
+  '
+}
+
+cmd_tail() {
+  local id=${1:-} turns=2 chars=900 tools=0
+  [[ $id =~ ^ses_[A-Za-z0-9]+$ ]] || die "usage: tail ID [--turns N] [--chars N] [--tools]"
+  shift
+  while (($#)); do
+    case $1 in
+      --turns) turns=${2:-}; shift ;;
+      --chars) chars=${2:-}; shift ;;
+      --tools) tools=1 ;;
+      *) die "tail: unknown option $1" ;;
+    esac
+    shift
+  done
+  [[ $turns =~ ^[0-9]+$ && $chars =~ ^[0-9]+$ ]] && ((turns >= 1 && turns <= 50)) || die "tail: --turns 1-50, --chars integer"
+  local alimit=$((turns * 25)) slimit=$((turns * 6))
+  ((alimit > 200)) && alimit=200
+  ((slimit > 200)) && slimit=200
+  local m=(--param sessionID="$id" --param order=desc)
+  api "$TMP/u.json" session.message.list "${m[@]}" --param type=user --param limit="$turns" || exit 1
+  api "$TMP/a.json" session.message.list "${m[@]}" --param type=assistant --param limit="$alimit" || exit 1
+  api "$TMP/y.json" session.message.list "${m[@]}" --param type=synthetic --param limit="$slimit" || exit 1
+  api "$TMP/i.json" session.message.list "${m[@]}" --param type=idle --param limit="$turns" || exit 1
+  api "$TMP/active.json" session.active || exit 1
+  q -r -n --argjson chars "$chars" --argjson tools "$tools" --arg id "$id" \
+    --slurpfile u "$TMP/u.json" --slurpfile a "$TMP/a.json" --slurpfile y "$TMP/y.json" --slurpfile i "$TMP/i.json" \
+    --slurpfile act "$TMP/active.json" "$JQ"'
+    def toolsum: "\(.name)(\(.state.status // "?")): \(.state.input // {} | (.command // .path // .filePath // .pattern // .description // .url // .) | txt(110))";
+    ($u[0].data | map(.time.created) | sort) as $starts
+    | ($starts[0] // 0) as $from
+    | def turn($t): [$starts[] | select(. <= $t)] | length;
+    ($chars / 3 | floor) as $brief
+    | [ $u[0].data[] | {t: .time.created, line: "user: \(.text | txt($chars / 2 | floor))"} ] as $users
+    | [ $a[0].data[] | select(.time.created >= $from)
+        | {t: .time.created, agent, text: ([.content[]? | select(.type == "text") | .text] | join(" ")),
+           tools: [.content[]? | select(.type == "tool")], err: .error} ] as $as
+    | [ $as | group_by(turn(.t))[]
+        | . as $g | ($g | map(select(.text != "" or .err)) | sort_by(.t)) as $said
+        | ($g | map(.tools) | add // []) as $calls
+        | ( if ($calls | length) > 0 then
+              {t: ($g | map(.t) | min), line: "  · \($calls | length) tool calls (\($calls | group_by(.name) | map("\(.[0].name) \(length)") | join(", ")))"
+                + (if ($said | length) > 3 then "; \(($said | length) - 3) earlier agent updates omitted" else "" end)}
+            else empty end ),
+          ( $said[-3:] | (length - 1) as $end | to_entries[] | (.key == $end) as $final | .value
+            | {t, line: "\(.agent // "agent"): \(.text | txt(if $final then $chars else $brief end))\(if .err then " ERROR " + (.err | txt(200)) else "" end)"} ),
+          ( if $tools == 1 then $g[] | .t as $t | .tools[] | {t: $t, line: "    \(toolsum)"} else empty end ) ] as $agent
+    | [ $y[0].data[] | select(.time.created >= $from and .metadata.source != "shell")
+        | {t: .time.created,
+           line: (if .metadata.source == "subagent"
+                  then "child \(.metadata.agent // "?") \(.metadata.state // "?") \(.metadata.childID // ""): \(.description // "" | txt(100)) — \(.text | sub("^<subagent[^>]*>\\s*"; "") | txt($brief))"
+                  else "note: \(.description // .text | txt(120))" end)} ] as $syn
+    | [ $i[0].data[] | select(.time.created >= $from)
+        | {t: .time.created, line: "· run \(.outcome // "ended")\(if .error then ": " + (.error | txt(200)) else "" end)"} ] as $idle
+    | "# \($id) · last \($users | length) user turn(s) · " + (if ($act[0].data // {})[$id] then "RUNNING" else "not running" end),
+      ($users + $agent + $syn + $idle | sort_by(.t)[] | "[\(.t | ts)] \(.line)"),
+      ( if ($act[0].data // {})[$id] then
+          ($a[0].data[0] // {} | [.content[]? | select(.type == "tool" and (.state.status == "running" or .state.status == "pending"))]
+           | select(length > 0) | "now: " + (map(toolsum) | join("; ")))
+        else empty end )
+  '
+}
+
+cmd_send() {
+  local peer=""
+  [[ ${1:-} == --peer ]] && { peer="peer-ok"; shift; }
+  local id=${1:-} mode=${2:-} text
+  [[ $mode == queue || $mode == steer ]] || die "usage: send [--peer] ID queue|steer TEXT|-"
+  target "$id" $peer || exit 2
+  [[ $(jq -r '.data.time.archived // ""' "$TMP/g.json") == "" ]] || die "$id is archived; restore it first"
+  [[ $(jq -r '.data.parentID // ""' "$TMP/g.json") == "" ]] || die "$id is a child; continue its owning root session instead"
+  api "$TMP/send-perm.json" session.permission.list --param sessionID="$id" || return 1
+  api "$TMP/send-form.json" session.form.list --param sessionID="$id" || return 1
+  if jq -e '.data | length > 0' "$TMP/send-perm.json" >/dev/null || jq -e '.data | length > 0' "$TMP/send-form.json" >/dev/null; then
+    die "$id is waiting on a permission/form; answer it in the client, not with a prompt"
+  fi
+  if [[ ${3:-} == - ]]; then text=$(cat); else text=${3:-}; fi
+  [[ -n ${text//[[:space:]]/} ]] || die "send: empty instruction"
+  api "$TMP/active.json" session.active || exit 1
+  jq -n --arg text "$text" --arg delivery "$mode" '{text: $text, delivery: $delivery}' >"$TMP/body.json"
+  if ! api "$TMP/r.json" session.prompt --param sessionID="$id" --data "$(cat "$TMP/body.json")"; then
+    echo "sessions: admission uncertain for $id; inspect show/inbox before retrying" >&2
+    return 1
+  fi
+  q -r --slurpfile act "$TMP/active.json" --arg id "$id" "$JQ"'
+    "admitted \(.data.id) to \($id) as \(.data.delivery) at \(.data.time.created | ts); "
+    + (if ($act[0].data // {})[$id]
+       then "session is running, so it delivers at the \(if .data.delivery == "queue" then "next idle boundary" else "next safe step boundary" end)"
+       else "session was idle, so delivery and execution start now" end)
+    + ". Admitted is not completed; verify with wait/tail."' "$TMP/r.json"
+}
+
+cmd_start() {
+  local dir="" agent="" title="" model="" text="" input=0 id
+  while (($#)); do
+    case $1 in
+      --directory) dir=${2:-}; shift ;;
+      --agent) agent=${2:-}; shift ;;
+      --title) title=${2:-}; shift ;;
+      --model) model=${2:-}; shift ;;
+      -) input=1 ;;
+      *) die "usage: start --directory /abs --agent ID --title TITLE [--model provider/model#variant] -" ;;
+    esac
+    shift
+  done
+  [[ $dir == /* && -d $dir && -n $agent && -n $title && $input == 1 ]] || die "start: existing absolute directory, agent, title, and stdin (-) required"
+  [[ $agent != opencode ]] || die "start: never create another coordinator"
+  [[ -z $model || $model =~ ^[^/[:space:]#]+/[^[:space:]#]+(#[^[:space:]#]+)?$ ]] || die "start: model must be provider/model#variant"
+  text=$(cat)
+  [[ -n ${text//[[:space:]]/} ]] || die "start: empty instruction"
+  # Native discovery includes all live roots/children; canonicalize to catch symlinks.
+  dir=$(realpath -- "$dir")
+  local checkout
+  checkout=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$dir")
+  api "$TMP/start-active.json" session.active || return 1
+  while read -r id; do
+    [[ $id == "$SELF" ]] && continue
+    api "$TMP/start-owner.json" session.get --param sessionID="$id" || return 1
+    local other
+    other=$(jq -r '.data | .location.directory + (if .subpath then "/" + .subpath else "" end)' "$TMP/start-owner.json")
+    other=$(realpath -m -- "$other")
+    other=$(git -C "$other" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$other")
+    [[ $checkout != "$other" ]] || die "start: $id is active in this checkout; use that session or a separate worktree"
+  done < <(jq -r '.data | keys[]' "$TMP/start-active.json")
+  jq -n --arg dir "$dir" --arg agent "$agent" --arg title "$title" --arg model "$model" '
+    {location: {directory: $dir}, agent: $agent, title: $title}
+    + (if $model != "" then ($model | capture("^(?<providerID>[^/]+)/(?<id>[^#]+)(?:#(?<variant>.+))?$")) as $m
+        | {model: ($m | with_entries(select(.value != null)))} else {} end)' >"$TMP/start-body.json"
+  if ! api "$TMP/created.json" session.create --data "$(cat "$TMP/start-body.json")"; then
+    echo "sessions: creation uncertain; inspect recent sessions by title/directory before retrying" >&2
+    return 1
+  fi
+  id=$(jq -er '.data.id | select(test("^ses_[A-Za-z0-9]+$"))' "$TMP/created.json") || return 1
+  echo "created $id; creation is not task completion. If admission fails, inspect this ID before retrying."
+  cmd_send "$id" queue "$text"
+}
+
+cmd_archive() { # archive|restore: change archive state, then verify it
+  local verb=$1 want=false running=0 rc=0 id cur
+  [[ $verb == archive ]] && want=true
+  shift
+  [[ $verb == archive && ${1:-} == --running ]] && { running=1; shift; }
+  (($#)) || die "usage: archive [--running] ID... | restore ID..."
+  api "$TMP/active.json" session.active || exit 1
+  for id in "$@"; do
+    target "$id" peer-ok || { rc=1; continue; }
+    cur=$(jq -r 'if .data.time.archived then "true" else "false" end' "$TMP/g.json")
+    if [[ $cur == "$want" ]]; then echo "$id already $([[ $want == true ]] && echo archived || echo unarchived); no-op"; continue; fi
+    if [[ $want == true && $running == 0 ]] && jq -e --arg id "$id" '.data[$id]' "$TMP/active.json" >/dev/null; then
+      echo "$id is running; skipped (archive a running session only with explicit authorization: --running)"
+      rc=1
+      continue
+    fi
+    api "$TMP/u.json" session.update --param sessionID="$id" --data "{\"archived\":$want}" || { rc=1; continue; }
+    api "$TMP/v.json" session.get --param sessionID="$id" || { rc=1; continue; }
+    if jq -e --arg want "$want" '($want == "true") == (.data.time.archived != null)' "$TMP/v.json" >/dev/null; then
+      q -r "$JQ"'.data | "\(.id) \(if .time.archived then "archived \(.time.archived | ts)" else "restored" end) (verified): \(.title // "" | txt(70))"' "$TMP/v.json"
+    else
+      echo "$id UNVERIFIED: archive state did not change"
+      rc=1
+    fi
+  done
+  return $rc
+}
+
+cmd_wait() {
+  local id=${1:-} secs=${2:-300} rc=0
+  [[ $secs =~ ^[0-9]+$ ]] && ((secs >= 1 && secs <= 1800)) || die "wait: seconds must be 1-1800"
+  target "$id" peer-ok || exit 2
+  timeout "$secs" opencode api experimental.session.wait --param sessionID="$id" >"$TMP/w.json" 2>&1 || rc=$?
+  api "$TMP/active.json" session.active || exit 1
+  api "$TMP/s.json" session.get --param sessionID="$id" || exit 1
+  if ((rc == 124)); then echo "# still running after ${secs}s"; elif ((rc != 0)); then echo "# wait failed (exit $rc; sensitive details withheld)"; fi
+  q -r --slurpfile act "$TMP/active.json" "$JQ"'($act[0].data // {}) as $active | .data
+    | "\(.id)  \(state($active))  last run \(.time.busy | ts) → \(.time.idle | ts)  \(.title // "" | txt(80))"' "$TMP/s.json"
+}
+
+cmd_server() {
+  api "$TMP/info.json" server.info || exit 1
+  jq -r '"server \(.hostname) v\(.version) pid \(.pid) urls \(.urls | join(" "))"' "$TMP/info.json"
+}
+
+usage() {
+  cat <<'EOF'
+sessions recent [--hours 48 | --day yesterday] [--match WORDS] [--search TITLE] [--agent ID] [--archived|--only-archived] [--kids] [--max 40]
+sessions review [--hours 48] [--match WORDS] [--max 10] [--scan-max 50]   bounded triage + details + final refresh
+sessions delivery ID [--branch NAME] [--commit SHA] [--remote NAME] [--directory /abs] [--evidence-message ID]
+                                    read-only Git/remote/PR evidence; checkout attribution is explicit
+sessions show ID                     metadata, state, inbox, pending permissions/forms, children
+sessions tail ID [--turns 2] [--chars 900] [--tools]   bounded recent history
+sessions send [--peer] ID queue|steer TEXT|-           admit an instruction (- reads stdin)
+sessions start --directory /abs --agent ID --title TITLE [--model provider/model#variant] -
+                                    create an independent root and admit stdin; explicit authority only
+sessions archive [--running] ID... | restore ID...     change archive state and verify it
+sessions wait ID [SECONDS=300]       bounded wait for idle (give the shell tool a longer timeout)
+sessions server                      server identity
+EOF
+}
+
+command -v jq >/dev/null && command -v opencode >/dev/null || die "requires jq and opencode"
+sub=${1:-help}
+shift || true
+case $sub in
+  recent) cmd_recent "$@" ;;
+  review) cmd_review "$@" ;;
+  delivery) cmd_delivery "$@" ;;
+  show) cmd_show "$@" ;;
+  tail) cmd_tail "$@" ;;
+  send) cmd_send "$@" ;;
+  start) cmd_start "$@" ;;
+  archive | restore) cmd_archive "$sub" "$@" ;;
+  wait) cmd_wait "$@" ;;
+  server) cmd_server ;;
+  help | -h | --help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
