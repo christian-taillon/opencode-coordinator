@@ -81,6 +81,49 @@ class BundleContracts(unittest.TestCase):
         self.assertIsNot(skill.get("autoinvoke"), True)
         self.assertTrue(os.access(HELPER, os.X_OK))
         self.assertEqual(subprocess.run(["bash", "-n", HELPER]).returncode, 0)
+        self.assertEqual(
+            subprocess.run(["bash", "-n", ROOT / "install.sh"]).returncode, 0
+        )
+
+    def test_public_install_is_bounded_and_licensed(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("./install.sh", readme)
+        self.assertIn("MIT", readme)
+        self.assertIn(
+            "Copyright (c) 2026 Christian Taillon", (ROOT / "LICENSE").read_text()
+        )
+        self.assertNotIn("No license is selected", readme)
+        script = ROOT / "install.sh"
+        self.assertTrue(os.access(script, os.X_OK))
+        with tempfile.TemporaryDirectory() as home:
+            env = {**os.environ, "HOME": home, "OPENCODE_CONFIG_DIR": ""}
+            subprocess.run(
+                [script], env=env, check=True, capture_output=True, text=True
+            )
+            dest = Path(home) / ".config/opencode"
+            for relative in (
+                "agents/opencode.md",
+                "skills/session-coordination/SKILL.md",
+                "skills/session-coordination/scripts/sessions",
+                "commands/session-review.md",
+                "commands/session-act.md",
+            ):
+                self.assertTrue((dest / relative).is_file(), relative)
+            self.assertTrue(
+                os.access(
+                    dest / "skills/session-coordination/scripts/sessions", os.X_OK
+                )
+            )
+            again = subprocess.run([script], env=env, capture_output=True, text=True)
+            self.assertNotEqual(again.returncode, 0)
+            self.assertIn("refusing to replace", again.stderr)
+        refused = subprocess.run(
+            [script],
+            env={**os.environ, "OPENCODE_CONFIG_DIR": "/tmp/not-the-standard-path"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(refused.returncode, 2)
 
     def test_commands_inherit_model_and_do_not_execute_interpolated_shell(self):
         for name in ("session-review", "session-act"):
