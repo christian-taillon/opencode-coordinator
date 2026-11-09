@@ -71,6 +71,24 @@ another instruction.
 A successful run is not proof that the task is finished. Missing evidence stays
 unknown.
 
+## Vendor discovery limits
+
+With Python 3.11+, the helper also supports `sessions claude review`,
+`sessions claude show EXACT_ID`, and `sessions codex capabilities`.
+Name the vendor explicitly in `/session-review` to use these paths.
+
+Claude review is **metadata only**: interactive/background identity, separate
+CLI/conversation IDs, reported state, as-of UTC, and explicit unknowns. It does
+not read transcripts or establish liveness, completion, pending approvals,
+context use, or quota. Codex reports installed CLI capabilities only; an
+advertised queue command is not bundle support or runtime qualification.
+
+Existing-session messaging is currently unsupported. `/session-act` returns a
+client handoff for vendor targets; it never substitutes a worker or resume call.
+`sessions claude send ID` returns unsupported without sending or reading stdin.
+Switchboard has foreground worker resume, not a verified arbitrary live-session
+messaging transport. No socket protocol or second adapter is introduced here.
+
 ## Safety
 
 - The coordinator cannot edit files or launch child agents.

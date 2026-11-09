@@ -694,12 +694,21 @@ sessions start --directory /abs --agent ID --title TITLE [--model provider/model
 sessions archive [--running] ID... | restore ID...     change archive state and verify it
 sessions wait ID [SECONDS=300]       bounded wait for idle (give the shell tool a longer timeout)
 sessions server                      server identity
+sessions claude capabilities|recent|review|show [EXACT_ID] [--max 20]
+                                    read-only CLI metadata; unknown work/input/accounting stays unknown
+sessions codex capabilities          installed CLI discovery only; no queue/resume execution
+sessions claude send ID              unsupported; returns client handoff without sending
 EOF
 }
 
-command -v jq >/dev/null && command -v opencode >/dev/null || die "requires jq and opencode"
 sub=${1:-help}
 shift || true
+if [[ $sub == claude || $sub == codex ]]; then
+  command -v python3 >/dev/null || die "vendor discovery requires python3"
+  python3 "$(dirname -- "${BASH_SOURCE[0]}")/vendor_sessions.py" "$sub" "$@"
+  exit $?
+fi
+command -v jq >/dev/null && command -v opencode >/dev/null || die "requires jq and opencode"
 case $sub in
   recent) cmd_recent "$@" ;;
   review) cmd_review "$@" ;;

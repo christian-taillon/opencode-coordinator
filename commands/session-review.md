@@ -9,6 +9,14 @@ archiving, or Git changes. Keep the current agent and model.
 
 Scope requested by the user: $ARGUMENTS
 
+If the scope explicitly names Claude or Codex, load `session-coordination` and
+use `sessions claude review [--max 20]` or `sessions codex capabilities` instead.
+Claude review is CLI metadata only, including interactive/background identity;
+replies, live execution, pending input and accounting remain unknown. Codex is
+capability discovery only. Report as-of, coverage and client handoff. Do not run
+native delivery checks against vendor IDs or launch a worker to obtain status.
+Otherwise follow the unchanged OpenCode workflow below.
+
 Run `~/.config/opencode/skills/session-coordination/scripts/sessions review`.
 Default: last 48 hours plus active work, scan up to 50 roots before selecting at
 most 10 for detail, and one bounded final refresh. `--hours`, `--match`, `--max`,

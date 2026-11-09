@@ -32,6 +32,8 @@ install -m 644 "$root/skills/session-coordination/SKILL.md" \
   "$dest/skills/session-coordination/SKILL.md"
 install -m 755 "$root/skills/session-coordination/scripts/sessions" \
   "$dest/skills/session-coordination/scripts/sessions"
+install -m 644 "$root/skills/session-coordination/scripts/vendor_sessions.py" \
+  "$dest/skills/session-coordination/scripts/vendor_sessions.py"
 install -m 644 "$root/commands/session-review.md" "$root/commands/session-act.md" \
   "$dest/commands/"
 

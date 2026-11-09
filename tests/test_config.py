@@ -105,6 +105,7 @@ class BundleContracts(unittest.TestCase):
                 "agents/opencode.md",
                 "skills/session-coordination/SKILL.md",
                 "skills/session-coordination/scripts/sessions",
+                "skills/session-coordination/scripts/vendor_sessions.py",
                 "commands/session-review.md",
                 "commands/session-act.md",
             ):
@@ -218,6 +219,181 @@ class ReviewEvalContracts(unittest.TestCase):
             missing = deepcopy(response)
             missing["cases"].pop()
             self.assertIn("missing, duplicate, or unknown", check(missing, 1))
+
+
+class VendorContracts(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="vendor-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.fixture = self.directory / "fixture.json"
+        self.calls = self.directory / "calls.jsonl"
+        self.data = {
+            "help": "--json --all Print active sessions (interactive and background) as a JSON array",
+            "rows": [
+                {
+                    "id": "bg_fixture",
+                    "sessionId": "conversation_fixture",
+                    "kind": "background",
+                    "state": "blocked",
+                    "name": "password=fixture-secret",
+                    "startedAt": 1,
+                },
+                {
+                    "id": "interactive_fixture",
+                    "kind": "interactive",
+                    "state": "working",
+                },
+            ],
+        }
+        for vendor in ("claude", "codex"):
+            fake = self.directory / vendor
+            fake.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                'with open(os.environ["VENDOR_CALLS"], "a") as f: f.write(json.dumps(args)+"\\n")\n'
+                'data = json.loads(Path(os.environ["VENDOR_FIXTURE"]).read_text())\n'
+                'if args == ["--version"]: print("fixture 1.0")\n'
+                'elif args == ["agents", "--help"]: print(data["help"])\n'
+                'elif args == ["queue", "--help"]: print("--thread --message --resume")\n'
+                'elif args == ["agents", "--json", "--all"]:\n'
+                ' if data.get("fail"): print("SECRET_DIAGNOSTIC", file=sys.stderr); sys.exit(1)\n'
+                ' print(data.get("raw", json.dumps(data["rows"])))\n'
+                'else: sys.exit("MUTATION_OR_UNEXPECTED_COMMAND")\n'
+            )
+            fake.chmod(0o755)
+        self.environment = {
+            **os.environ,
+            "PATH": f"{self.directory}:{os.environ['PATH']}",
+            "VENDOR_CALLS": str(self.calls),
+            "VENDOR_FIXTURE": str(self.fixture),
+        }
+
+    def run_vendor(self, *args, code=0):
+        self.fixture.write_text(json.dumps(self.data))
+        before = self.fixture.read_bytes()
+        result = subprocess.run(
+            [HELPER, *args],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            input="NEVER_SEND_OR_READ",
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.read_bytes(), before)
+        self.assertNotIn("SECRET_DIAGNOSTIC", result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_metadata_identity_staleness_caps_and_nonmutation(self):
+        packet = self.run_vendor("claude", "review", "--max", "1")
+        self.assertIn("+00:00", packet["as_of"])
+        self.assertEqual(packet["omitted"], 1)
+        row = packet["sessions"][0]
+        self.assertEqual(row["conversation_id"], "conversation_fixture")
+        self.assertEqual(row["frontend"], "background")
+        self.assertEqual(row["state_reported"], "blocked")
+        self.assertEqual(row["execution"], "unknown")
+        self.assertIn("stale", row["evidence"])
+        self.assertNotIn("fixture-secret", json.dumps(packet))
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual(
+            calls, [["--version"], ["agents", "--help"], ["agents", "--json", "--all"]]
+        )
+        exact = self.run_vendor("claude", "show", "conversation_fixture")
+        self.assertEqual(len(exact["sessions"]), 1)
+        missing = self.run_vendor("claude", "show", "fixture", code=2)
+        self.assertEqual(missing["status"], "not-found")
+
+    def test_accounting_input_denials_and_inbox_are_not_inferred(self):
+        for extra in (
+            {},
+            {"usage": 0, "tokens": 0, "context": 0},
+            {"question": "Choose scope?", "permission_denials": ["Edit"]},
+            {"permissions": ["shell"], "forms": ["choice"], "accepted": True},
+        ):
+            self.data["rows"][0].update(extra)
+            row = self.run_vendor("claude", "review")["sessions"][0]
+            for key in ("permissions", "forms", "tool_denials", "usage"):
+                self.assertIsNone(row[key])
+            self.assertIsNone(row["context"]["percent"])
+            self.assertEqual(
+                row["inbox"], dict(accepted=None, read=None, executed=None)
+            )
+            self.assertEqual(row["work_status"], "unknown")
+        interactive = self.run_vendor("claude", "show", "interactive_fixture")[
+            "sessions"
+        ][0]
+        self.assertEqual(interactive["frontend"], "interactive")
+
+    def test_interactive_null_cli_id_preserves_conversation_identity(self):
+        self.data["rows"] = [
+            {
+                "id": None,
+                "sessionId": "conversation_interactive",
+                "kind": "interactive",
+                "state": "working",
+            }
+        ]
+        row = self.run_vendor("claude", "show", "conversation_interactive")["sessions"][
+            0
+        ]
+        self.assertIsNone(row["id"])
+        self.assertEqual(row["conversation_id"], "conversation_interactive")
+        self.assertEqual(row["frontend"], "interactive")
+
+    def test_unverified_help_incompatible_json_and_failed_discovery(self):
+        self.data["help"] = "--json not a verified contract"
+        self.assertEqual(
+            self.run_vendor("claude", "review", code=2)["status"], "unsupported"
+        )
+        self.assertNotIn(
+            ["agents", "--json", "--all"],
+            [json.loads(line) for line in self.calls.read_text().splitlines()],
+        )
+        self.data["help"] = "--json --all interactive and background JSON array"
+        for raw in ("invalid", "{}", "[1]"):
+            self.data["raw"] = raw
+            self.assertEqual(
+                self.run_vendor("claude", "review", code=2)["status"], "unavailable"
+            )
+        self.data["fail"] = True
+        self.assertEqual(
+            self.run_vendor("claude", "review", code=2)["status"], "unavailable"
+        )
+
+    def test_unsupported_send_never_calls_vendor_or_reads_prompt(self):
+        for vendor in ("claude", "codex"):
+            packet = self.run_vendor(vendor, "send", "fixture", code=2)
+            self.assertEqual(packet["effects"], "none")
+            self.assertIn("no message admitted", packet["reason"])
+        self.assertFalse(self.calls.exists())
+
+    def test_codex_advertised_queue_is_not_supported_execution(self):
+        packet = self.run_vendor("codex", "capabilities")
+        self.assertTrue(packet["capabilities"]["queue_advertised"])
+        self.assertEqual(
+            packet["capabilities"]["message"], "unsupported by this bundle"
+        )
+        self.assertEqual(
+            self.run_vendor("codex", "review", code=2)["status"], "unsupported"
+        )
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertTrue(all(call[-1] in ("--help", "--version") for call in calls))
+
+    def test_missing_executable_is_explicit(self):
+        (self.directory / "claude").unlink()
+        # Isolate PATH so a user's installed Claude can never be the test fallback.
+        python = self.directory / "python3"
+        python.symlink_to(sys.executable)
+        for name in ("bash", "dirname", "mktemp", "rm"):
+            (self.directory / name).symlink_to(shutil.which(name))
+        self.environment["PATH"] = str(self.directory)
+        packet = self.run_vendor("claude", "capabilities", code=2)
+        self.assertEqual(packet["capabilities"]["probe_error"], "executable missing")
+        self.assertFalse(self.calls.exists())
 
 
 class HelperContracts(unittest.TestCase):

@@ -1,6 +1,6 @@
 ---
 name: session-coordination
-description: Discover, inspect, continue, monitor, and archive OpenCode sessions across all projects on this server through the native session API. Use for questions about recent, running, or unfinished sessions, where work left off, directing another session, session cleanup, or a session's GitHub/CI follow-up. Not for ordinary coding in the current session.
+description: Coordinate OpenCode sessions through the native API, review Claude CLI session metadata, and discover Codex CLI capabilities. Use for recent or unfinished sessions, directing owned work, or session follow-up. Not for ordinary coding in the current session.
 ---
 
 # Session coordination
@@ -11,6 +11,53 @@ common credential shapes, and refuses to target `$OPENCODE_SESSION_ID`. Run
 `S help` for options. Reuse earlier output unless state may have changed.
 
 ## Retrieval levels
+
+### Claude and Codex boundary
+
+For an explicitly named vendor, use `S claude capabilities`, `S claude review
+[--max 20]`, `S claude show EXACT_ID`, or `S codex capabilities` instead of native
+OpenCode IDs. Vendor discovery additionally requires Python 3.11+. Existing
+OpenCode commands and their defaults are unchanged; cross-vendor review is not
+automatic.
+
+Claude discovery verifies installed `agents --help` before running only
+`claude agents --json --all`. Review/recent/show are metadata-only views, not
+transcript review or model calls. They include interactive/background identity,
+separate CLI ID and conversation ID, reported state, as-of UTC and explicit
+unknowns. Up to 20 rows (1–100) are displayed in CLI order, with omitted count;
+`show` matches either ID exactly, never a partial name. Discovery may be stale:
+`working`, `blocked`, `done` or `failed` are reported states, not independently
+verified execution or whole-task completion. No last-progress time is available.
+Missing/zero accounting is not 0% context, free execution, or a quota balance.
+
+Pending permissions, structured questions/forms, tool denials, and free-text
+decisions are different evidence. This metadata contract does not expose them;
+all stay unknown, never inferred from `blocked` or text. Inbox accepted/read/
+executed also remain separately unknown. Inspect the existing client for replies
+and pending input; no transcript store or terminal-output parser is used.
+
+**Messaging is unsupported here**, even with explicit send authority:
+`S claude send ID` returns a nonzero structured client handoff without consuming
+stdin or calling a vendor. Do not substitute `--resume -p`, `--bg`, a socket,
+Switchboard delegation, or a new worker. Installed Claude 2.1.319 help exposes
+discovery/attach/logs but no verified existing-session messaging action; background
+resume may copy a running session. Switchboard supports foreground worker resume,
+not arbitrary live-session inbox messaging. Reusable messaging belongs there if
+a supported contract becomes available, not in another adapter here.
+
+Codex 0.166.0 help advertises `agents` and `queue --thread --message`, with optional
+resume. `S codex capabilities` reports that advertisement separately from bundle
+support: no Codex session discovery, queue, resume or API transport is implemented
+or runtime-qualified. Unsupported operations return client handoff, never guessed
+socket protocols. Capability help is not authentication, available quota, or proof
+of a resolved model. Recheck help on upgrades.
+
+In either client, verify the exact existing session first. Answer structured input
+there, not via an ordinary prompt; never bypass a permission/tool denial or replay
+classifier-stopped work. A transport accepting an inbox item would not prove it
+was read or executed. No automatic retry, replacement session, or monitoring.
+
+### OpenCode
 
 For an attention/review request, prefer the native `/session-review` command or
 `S review [--hours 48] [--match WORDS] [--max 10] [--scan-max 50]` first. It scans
