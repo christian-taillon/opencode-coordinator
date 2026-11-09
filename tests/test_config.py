@@ -106,6 +106,8 @@ class BundleContracts(unittest.TestCase):
                 "skills/session-coordination/SKILL.md",
                 "skills/session-coordination/scripts/sessions",
                 "skills/session-coordination/scripts/vendor_sessions.py",
+                "skills/session-coordination/scripts/inventory.py",
+                "commands/session-status.md",
                 "commands/session-review.md",
                 "commands/session-act.md",
             ):
@@ -127,7 +129,7 @@ class BundleContracts(unittest.TestCase):
         self.assertEqual(refused.returncode, 2)
 
     def test_commands_inherit_model_and_do_not_execute_interpolated_shell(self):
-        for name in ("session-review", "session-act"):
+        for name in ("session-status", "session-review", "session-act"):
             config, body = frontmatter(ROOT / "commands" / f"{name}.md")
             self.assertEqual(set(config), {"description", "subagent"})
             self.assertIs(config["subagent"], False)
@@ -138,8 +140,8 @@ class BundleContracts(unittest.TestCase):
         self.assertIn("unknown", review)
         action = (ROOT / "commands/session-act.md").read_text()
         for contract in (
-            "S send ID queue",
-            "S start",
+            "send ID queue",
+            "start --directory",
             "in their client",
             "explicit",
             "admitted",
@@ -344,6 +346,13 @@ class VendorContracts(unittest.TestCase):
         self.assertEqual(row["conversation_id"], "conversation_interactive")
         self.assertEqual(row["frontend"], "interactive")
 
+    def test_vendor_review_rejects_credential_shaped_ids_without_rewriting(self):
+        for identifier in ("bg_AKIA1234567890123456", "sk-abcdefghijklmnop"):
+            self.data["rows"][0]["id"] = identifier
+            packet = self.run_vendor("claude", "review", code=2)
+            self.assertEqual(packet["status"], "unavailable")
+            self.assertNotIn(identifier, json.dumps(packet))
+
     def test_unverified_help_incompatible_json_and_failed_discovery(self):
         self.data["help"] = "--json not a verified contract"
         self.assertEqual(
@@ -354,7 +363,7 @@ class VendorContracts(unittest.TestCase):
             [json.loads(line) for line in self.calls.read_text().splitlines()],
         )
         self.data["help"] = "--json --all interactive and background JSON array"
-        for raw in ("invalid", "{}", "[1]"):
+        for raw in ("invalid", "{}", "[1]", "[" * 2000 + "0" + "]" * 2000):
             self.data["raw"] = raw
             self.assertEqual(
                 self.run_vendor("claude", "review", code=2)["status"], "unavailable"

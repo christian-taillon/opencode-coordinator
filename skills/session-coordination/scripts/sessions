@@ -5,6 +5,11 @@ set -euo pipefail
 umask 077
 
 SELF=${OPENCODE_SESSION_ID:-}
+# The fast path does not allocate shell scratch state or require jq/OpenCode.
+if [[ ${1:-} == overview || ${1:-} == cleanup-plan ]]; then
+  command -v python3 >/dev/null || { echo 'sessions: overview requires Python 3.11+' >&2; exit 2; }
+  exec python3 -B "$(dirname -- "${BASH_SOURCE[0]}")/inventory.py" "$@"
+fi
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/oc-sessions.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
@@ -682,6 +687,10 @@ cmd_server() {
 
 usage() {
   cat <<'EOF'
+sessions overview [--json] [--days 14] [--max 20] [--project TEXT] [--machine ID|local | --all-machines]
+                                    fast metadata only; no transcripts, per-root checks, Git or inference
+sessions cleanup-plan --project TEXT [--days 14] [--max 20] [--offset 0]
+                                    bounded pending-input check; not completion or archive approval
 sessions recent [--hours 48 | --day yesterday] [--match WORDS] [--search TITLE] [--agent ID] [--archived|--only-archived] [--kids] [--max 40]
 sessions review [--hours 48] [--match WORDS] [--max 10] [--scan-max 50]   bounded triage + details + final refresh
 sessions delivery ID [--branch NAME] [--commit SHA] [--remote NAME] [--directory /abs] [--evidence-message ID]

@@ -19,6 +19,7 @@ jobs:
           command -v jq
           command -v shellcheck
           uv run tests/test_config.py
+          uv run tests/test_inventory.py
           bash -n install.sh skills/session-coordination/scripts/sessions
           shellcheck -S warning install.sh skills/session-coordination/scripts/sessions
           git diff --check

@@ -16,6 +16,7 @@ fi
 for path in \
   "$dest/agents/opencode.md" \
   "$dest/skills/session-coordination" \
+  "$dest/commands/session-status.md" \
   "$dest/commands/session-review.md" \
   "$dest/commands/session-act.md"
 do
@@ -34,9 +35,11 @@ install -m 755 "$root/skills/session-coordination/scripts/sessions" \
   "$dest/skills/session-coordination/scripts/sessions"
 install -m 644 "$root/skills/session-coordination/scripts/vendor_sessions.py" \
   "$dest/skills/session-coordination/scripts/vendor_sessions.py"
-install -m 644 "$root/commands/session-review.md" "$root/commands/session-act.md" \
+install -m 644 "$root/skills/session-coordination/scripts/inventory.py" \
+  "$dest/skills/session-coordination/scripts/inventory.py"
+install -m 644 "$root/commands/session-status.md" "$root/commands/session-review.md" "$root/commands/session-act.md" \
   "$dest/commands/"
 
 printf 'Installed the coordinator into %s\n' "$dest"
 printf 'Choose an available model in agents/opencode.md before first use if needed.\n'
-printf 'Start with: opencode run --agent opencode "What is running, and what needs me?"\n'
+printf 'Fast status: %s/skills/session-coordination/scripts/sessions overview\n' "$dest"

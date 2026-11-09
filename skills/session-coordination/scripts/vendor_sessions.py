@@ -39,15 +39,19 @@ def safe(value):
     # Metadata is untrusted too. Do not emit unknown fields or raw diagnostics.
     value = str(value) if value is not None else ""
     value = re.sub(
-        r"(?i)(api[_-]?key|secret|token|password|pwd)\s*[:=]\s*\S+",
+        r"""(?i)(api[_-]?key|access[_-]?key|secret|token|passw(?:or)?d|pwd)["']?\s*[:=]\s*["']?[^\s"',;&]+""",
         r"\1=<redacted>",
         value,
     )
     value = re.sub(r"(?i)(bearer|basic)\s+\S+", r"\1 <redacted>", value)
     value = re.sub(r"://[^/\s@]+@", "://<redacted>@", value)
     value = re.sub(
-        r"sk-[\w-]{16,}|gh[pousr]_[\w]{20,}|github_pat_[\w]{20,}", "<redacted>", value
+        r"sk-[\w-]{16,}|gh[pousr]_[\w]{20,}|github_pat_[\w]{20,}|xox[abprs]-[\w-]{10,}|AKIA[0-9A-Z]{16}|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{4,}",
+        "<redacted>",
+        value,
     )
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    value = "".join(c if c.isprintable() or c.isspace() else " " for c in value)
     return " ".join(value.split())[:240]
 
 
@@ -94,11 +98,19 @@ def capabilities(vendor):
 
 def review(rows, maximum, target):
     def identifier(value):
-        return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value)
+        return (
+            isinstance(value, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value)
+            and safe(value) == value
+        )
 
     if not isinstance(rows, list) or any(
         not isinstance(row, dict)
         or not (identifier(row.get("id")) or identifier(row.get("sessionId")))
+        or any(
+            value is not None and not identifier(value)
+            for value in (row.get("id"), row.get("sessionId"))
+        )
         for row in rows
     ):
         raise ValueError("expected JSON array of session objects")
@@ -195,7 +207,7 @@ def main():
                     status="not-found",
                     reason="Not in discovery; absence is not proof of deletion or completion",
                 )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             packet.update(
                 status="unavailable",
                 reason="Discovery failed or incompatible JSON; details withheld",
