@@ -63,7 +63,11 @@ files=(
   commands/session-review.md
   commands/session-act.md
 )
-stage=$(mktemp -d /tmp/opencode/coordinator-install.XXXXXX)
+scratch=${TMPDIR:-/tmp}
+if test -d /tmp/opencode; then
+  scratch=/tmp/opencode
+fi
+stage=$(mktemp -d "$scratch/coordinator-install.XXXXXX")
 backup=$(mktemp -d "$HOME/.config/opencode-coordinator-backup.XXXXXX")
 git -C "$repo" archive "$revision" -- "${files[@]}" | tar -x -C "$stage"
 for path in "${files[@]}"; do

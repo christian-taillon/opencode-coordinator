@@ -16,6 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills/session-coordination/scripts"
 HELPER = SCRIPTS / "sessions"
+PREFERRED_SCRATCH = Path("/tmp/opencode")
 
 
 def records(packet):
@@ -31,7 +32,8 @@ def coverage(packet, name, machine="local"):
 class InventoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(
-            prefix="inventory-", dir="/tmp/opencode"
+            prefix="inventory-",
+            dir=PREFERRED_SCRATCH if PREFERRED_SCRATCH.is_dir() else None,
         )
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name)
@@ -156,6 +158,26 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(coverage(packet, "opencode")["status"], "observed")
         self.assertEqual(packet["counts"]["roots"], 0)
 
+    def test_fixture_scratch_falls_back_to_tmpdir_when_preferred_directory_is_absent(
+        self,
+    ):
+        fallback = self.path / "standard-temp"
+        fallback.mkdir()
+        code = (
+            f"import sys;sys.path.insert(0,{str(ROOT / 'tests')!r});import test_inventory;"
+            "test_inventory.PREFERRED_SCRATCH=test_inventory.Path(sys.argv[1]);"
+            "case=test_inventory.InventoryTests();case.setUp();"
+            "print(case.path.parent);case.doCleanups()"
+        )
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", code, str(self.path / "absent-preferred")],
+            env={**self.environment, "TMPDIR": str(fallback)},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(Path(result.stdout.strip()), fallback)
+
     def test_installed_executable_runs_outside_repository_without_alias(self):
         for name in ("mkdir", "install"):
             (self.path / name).symlink_to(shutil.which(name))
@@ -243,10 +265,10 @@ class InventoryTests(unittest.TestCase):
         agent.write_text(customization)
         config = dest / "opencode.json"
         config.write_text('{"fixture":"preserve"}')
-        script = script.replace(
-            "/tmp/opencode/coordinator-install.",
-            str(self.path / "coordinator-install."),
-        )
+        fallback = self.path / "standard-temp"
+        fallback.mkdir()
+        env["TMPDIR"] = str(fallback)
+        script = script.replace("/tmp/opencode", str(self.path / "absent-preferred"))
         result = subprocess.run(
             ["bash", "-c", script],
             cwd=repo,
@@ -267,6 +289,39 @@ class InventoryTests(unittest.TestCase):
         self.assertTrue(
             os.access(dest / "skills/session-coordination/scripts/sessions", os.X_OK)
         )
+        self.assertEqual(len(list(fallback.glob("coordinator-install.*"))), 1)
+
+    def test_documented_update_scratch_prefers_existing_directory_otherwise_tmpdir(
+        self,
+    ):
+        readme = (
+            (ROOT / "README.md")
+            .read_text()
+            .split("<!-- existing-install-update -->", 1)[1]
+        )
+        script = re.search(r"```bash\n(.*?)\n```", readme, re.S)[1]
+        scratch = "scratch=" + script.split("scratch=", 1)[1].split("\nbackup=", 1)[0]
+        preferred, fallback = self.path / "preferred", self.path / "standard-temp"
+        preferred.mkdir()
+        fallback.mkdir()
+        for candidate, expected in (
+            (preferred, preferred),
+            (self.path / "absent-preferred", fallback),
+        ):
+            with self.subTest(preferred=candidate):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        scratch.replace("/tmp/opencode", str(candidate))
+                        + '\nprintf "%s\\n" "$stage"',
+                    ],
+                    env={**os.environ, "TMPDIR": str(fallback)},
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(Path(result.stdout.strip()).parent, expected)
 
     def test_project_filter_max_and_invalid_flags(self):
         packet, _ = self.invoke("--json", "--project", "project_1", "--max", "2")
