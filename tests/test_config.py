@@ -36,6 +36,7 @@ class BundleContracts(unittest.TestCase):
         self.assertEqual(agent["mode"], "primary")
         self.assertRegex(agent["model"], r"^[^/\s#]+/[^\s#]+(?:#[^\s#]+)?$")
         self.assertLessEqual(len(body.split()), 260)
+        self.assertIn("Use `/session-review` reporting rules.", body)
         rules = agent["permissions"]
         self.assertEqual(rules[0], {"action": "*", "resource": "*", "effect": "deny"})
         for rule in rules:
@@ -160,6 +161,16 @@ class BundleContracts(unittest.TestCase):
             "exact IDs",
             "duplicate new session",
             "Suggestions never execute",
+            "Archive evidence gate",
+            "one record per exact source session ID",
+            "Reject duplicate/unknown IDs or contradictory classifications",
+            "known-empty inbox/permissions/forms",
+            "complete settled-child evidence",
+            "Fork ancestry",
+            "source message ID",
+            "reuse completed transcript and Git/PR investigation",
+            "server.continuity",
+            "one compact row per session grouped by project",
         ):
             self.assertIn(contract, body)
 
@@ -174,7 +185,7 @@ class ReviewEvalContracts(unittest.TestCase):
         )
         packet = result.stdout.split("<cases>\n", 1)[1].split("\n</cases>", 1)[0]
         cases = json.loads(packet)
-        self.assertEqual(len(cases), 8)
+        self.assertEqual(len(cases), 15)
         self.assertTrue(all(set(c) == {"id", "evidence"} for c in cases))
         self.assertIn("Do not call tools, APIs, or models", result.stdout)
         self.assertNotIn("$ARGUMENTS", result.stdout)
@@ -187,6 +198,8 @@ class ReviewEvalContracts(unittest.TestCase):
             "cases": [
                 {
                     "id": c["id"],
+                    "session_id": c["evidence"]["id"],
+                    "archive_candidate": c["expected"].get("archive_candidate", False),
                     **{
                         key: value[0] if isinstance(value, list) else value
                         for key, value in c["expected"].items()
@@ -209,11 +222,13 @@ class ReviewEvalContracts(unittest.TestCase):
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
                 return result.stdout
 
-            self.assertIn("8/8 objective cases passed", check(response, 0))
+            self.assertIn("15/15 objective cases passed", check(response, 0))
             for key, value in (
                 ("work_status", "reported-complete"),
                 ("automatic_actions", True),
                 ("target_session", "ses_replacement"),
+                ("session_id", "ses_mistyped"),
+                ("archive_candidate", True),
             ):
                 bad = deepcopy(response)
                 bad["cases"][0][key] = value
@@ -221,6 +236,28 @@ class ReviewEvalContracts(unittest.TestCase):
             missing = deepcopy(response)
             missing["cases"].pop()
             self.assertIn("missing, duplicate, or unknown", check(missing, 1))
+            duplicate = deepcopy(response)
+            conflicting = deepcopy(duplicate["cases"][0])
+            conflicting["work_status"] = "reported-complete"
+            conflicting["archive_candidate"] = True
+            duplicate["cases"].append(conflicting)
+            self.assertIn("missing, duplicate, or unknown", check(duplicate, 1))
+            unknown_permission = deepcopy(response)
+            row = next(
+                r
+                for r in unknown_permission["cases"]
+                if r["id"] == "unknown-permission-is-not-empty"
+            )
+            row["archive_candidate"] = True
+            self.assertIn("archive_candidate", check(unknown_permission, 1))
+            uncited_handoff = deepcopy(response)
+            row = next(
+                r
+                for r in uncited_handoff["cases"]
+                if r["id"] == "explicit-handoff-not-original-owner"
+            )
+            row["handoff_message_id"] = "msg_unrelated"
+            self.assertIn("handoff_message_id", check(uncited_handoff, 1))
 
 
 class VendorContracts(unittest.TestCase):
@@ -929,6 +966,163 @@ class HelperContracts(unittest.TestCase):
         self.assertIn('"execution": "unknown"', output)
         self.assertIn('"refresh": "unavailable"', output)
         self.assertNotIn("fixture-failure-secret", output)
+
+    def review_packet(self, *args):
+        result = subprocess.run(
+            [HELPER, "review", *args],
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("fixture-failure-secret", result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_review_restart_refreshes_idle_inputs_without_repeating_unchanged_history(
+        self,
+    ):
+        self.state["active"] = {}
+        self.state["operation_events"] = {
+            "server.info": [
+                {},
+                {
+                    "server_info": {
+                        "hostname": "fixture-host",
+                        "version": "2.2.7",
+                        "pid": 2,
+                        "urls": ["https://user:NEVER_EMIT@fixture.invalid"],
+                        "paths": {"tmp": "/private/NEVER_EMIT"},
+                    },
+                    "inbox": {"ses_root": [{"type": "synthetic"}]},
+                },
+            ]
+        }
+        self.write_state()
+        packet = self.review_packet("--match", "Example API")
+        row = packet["sessions"][0]
+        self.assertEqual(packet["server"]["continuity"], "changed")
+        self.assertEqual(packet["server"]["at_scan"]["pid"], 1)
+        self.assertEqual(packet["server"]["at_refresh"]["pid"], 2)
+        self.assertNotIn("NEVER_EMIT", json.dumps(packet))
+        self.assertEqual(row["refresh"], "refreshed")
+        self.assertEqual(row["inbox_count"], 1)
+        self.assertEqual(row["cleanup_gate"]["state"], "blocked")
+        self.assertFalse(row["history_changed"])
+        for field in ("pending_checked_at", "history_checked_at"):
+            self.assertRegex(row[field], r"^\d{4}-\d{2}-\d{2}T")
+        calls = self.read_state()["calls"]
+        history = [c for c in calls if c[0] == "session.message.list"]
+        self.assertEqual(
+            len(history), 3
+        )  # Scan user/assistant, then detailed assistant.
+        self.assertTrue(all(c[1]["sessionID"] == "ses_root" for c in history))
+        self.assertEqual(sum(c[0] == "session.inbox.list" for c in calls), 2)
+        self.assertFalse(
+            any(c[0] in {"session.prompt", "session.update"} for c in calls)
+        )
+
+    def test_review_unknown_server_identity_refreshes_inputs_and_labels_triage(self):
+        self.state["operation_events"] = {
+            "server.info": [{}, {"fail_operations": ["server.info"]}]
+        }
+        self.write_state()
+        packet = self.review_packet("--max", "1")
+        self.assertEqual(packet["server"]["continuity"], "unknown")
+        self.assertIsNone(packet["server"]["at_refresh"])
+        self.assertEqual(packet["refreshed_roots"], 1)
+        for row in packet["triage"]:
+            self.assertEqual(row["cleanup_gate"]["state"], "unknown")
+            self.assertEqual(row["evidence_level"], "triage")
+            self.assertEqual(row["execution"], "unknown")
+            self.assertEqual(row["work_status"]["state"], "unknown")
+            self.assertIn("execution_at_scan", row)
+            self.assertIn("continuity changed or unknown", row["freshness"])
+
+    def test_review_active_refresh_failure_is_unknown_not_zero_running(self):
+        self.state["active"] = {
+            "ses_root": {"type": "running"},
+            "ses_child": {"type": "running"},
+        }
+        self.state["operation_events"] = {
+            "session.active": [{}, {"fail_operations": ["session.active"]}]
+        }
+        self.write_state()
+        packet = self.review_packet("--match", "Example API")
+        self.assertIsNone(packet["active_count_including_self_and_children"])
+        row = packet["sessions"][0]
+        self.assertEqual(row["execution"], "unknown")
+        self.assertEqual(row["refresh"], "unavailable")
+        self.assertEqual(row["children"][0]["execution"], "unknown")
+        self.assertEqual(row["cleanup_gate"]["state"], "unknown")
+
+    def test_review_known_blocker_survives_other_unknown_checks_and_history_is_reused(
+        self,
+    ):
+        self.state["session.form.list"] = {
+            "ses_root": [{"id": "form_fixture", "title": "Choose scope"}]
+        }
+        self.state["fail_operations"] = ["session.permission.list"]
+        self.write_state()
+        packet = self.review_packet("--match", "Example API")
+        row = packet["sessions"][0]
+        self.assertIsNone(row["permissions"])
+        self.assertEqual(row["attention"], "needs-user")
+        self.assertEqual(row["cleanup_gate"]["state"], "blocked")
+        self.assertEqual(packet["server"]["continuity"], "stable")
+        history = [
+            c for c in self.read_state()["calls"] if c[0] == "session.message.list"
+        ]
+        self.assertEqual(len(history), 3)
+
+    def test_review_permission_failure_never_qualifies_cleanup(self):
+        self.state["messages"][1].update(finish="stop")
+        self.state["fail_operations"] = ["session.permission.list"]
+        self.write_state()
+        packet = self.review_packet("--match", "Example API")
+        self.assertEqual(packet["sessions"][0]["cleanup_gate"]["state"], "unknown")
+
+    def test_review_exact_ids_are_disjoint_and_fork_is_only_structural_evidence(self):
+        packet = self.review_packet("--max", "1")
+        rows = packet["sessions"] + packet["triage"]
+        ids = [r["id"] for r in rows]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(set(ids) <= set(self.state["sessions"]))
+        fork = next(r for r in rows if r["id"] == "ses_fork")
+        self.assertEqual(fork["fork_of"], "ses_root")
+        self.assertEqual(fork["project_id"], "project_fixture")
+        self.assertNotIn("owner", fork)
+        self.assertNotIn("superseded", fork)
+        self.assertEqual(fork["user_message_id"], "msg_fixture0")
+
+    def test_review_finished_reply_still_needs_targeted_cleanup_verification(self):
+        self.state["messages"][1].update(finish="stop")
+        self.write_state()
+        packet = self.review_packet("--match", "Independent continuation")
+        row = packet["sessions"][0]
+        self.assertEqual(row["cleanup_gate"]["state"], "needs-targeted-review")
+        self.assertIn("Full child coverage", row["cleanup_gate"]["basis"])
+        self.assertEqual(row["evidence_level"], "detail")
+
+    def test_review_running_progress_refreshes_even_when_run_timestamps_are_unchanged(
+        self,
+    ):
+        self.state["active"] = {"ses_root": {"type": "running"}}
+        messages = deepcopy(self.state["messages"])
+        messages[1]["content"] = [{"type": "text", "text": "New streaming progress"}]
+        self.state["operation_events"] = {
+            "session.active": [{}, {"messages": messages}]
+        }
+        self.write_state()
+        packet = self.review_packet("--match", "Example API")
+        row = packet["sessions"][0]
+        self.assertFalse(row["history_changed"])
+        self.assertEqual(row["execution"], "running")
+        self.assertIn("New streaming progress", row["reply"])
+        history = [
+            c for c in self.read_state()["calls"] if c[0] == "session.message.list"
+        ]
+        self.assertEqual(len(history), 5)
 
     def test_send_blocks_forms_permissions_and_children(self):
         for operation in ("session.form.list", "session.permission.list"):

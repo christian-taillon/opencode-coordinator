@@ -57,6 +57,9 @@ def flags($active): [
   (if .agent == "opencode" and .id != $self then "coordinator" else empty end)
 ] | join(",");
 def model: if .model then "\(.model.providerID)/\(.model.id)\(if .model.variant then "#" + .model.variant else "" end)" else "-" end;
+def server_identity:
+  if type == "object" and (.pid | type) == "number" and (.version | type) == "string"
+  then {hostname, version, pid} else null end;
 '
 q() { jq --arg home "$HOME" --arg self "$SELF" "$@"; }
 
@@ -152,11 +155,13 @@ cmd_recent() {
     | map(select($until == 0 or .last < $until))
     | sort_by(-.score, (if $json == 1 and ($active[.r.id] or (.k | any($active[.id]))) then 0 else 1 end), -.last) as $sel
     | if $json == 1 then ($sel | map(select(.r.id != $self))) as $review
-        | {as_of: (now | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")), total: ($review | length), scan_capped: ($capped == 1),
+        | {as_of: (now | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")), server: ($info[0] | server_identity), total: ($review | length), scan_capped: ($capped == 1),
          unresolved_parent_groups: ([$w[] | .parentID // empty] | unique | map(. as $p | select($roots | any(.id == $p) | not)) | length),
          active_count: ($active | length), self_excluded: $self, sessions: [$review[0:$max][] |
-          {id: .r.id, title: (.r.title // "" | txt(120)), directory: .r.location.directory,
-           subpath: .r.subpath, agent: .r.agent, selected_model: (.r | model),
+           {id: .r.id, project_id: .r.projectID, fork_of: .r.fork.sessionID,
+            title: (.r.title // "" | txt(120)), directory: .r.location.directory,
+            subpath: .r.subpath, agent: .r.agent, selected_model: (.r | model),
+            history_marker: [.r.time.updated, .r.time.busy, .r.time.idle],
             last_activity: (.last | ts), last_activity_ms: .last,
             run_started_at: (.r.time.busy | ts), run_started_ms: .r.time.busy,
            execution: (.r | state($active)), flags: (.r | flags($active)),
@@ -212,8 +217,8 @@ cmd_show() {
   '
 }
 
-review_fetch() { # Cache bounded evidence; no model call or session mutation.
-  local id=$1 cache=$2 limit=$3 op child
+review_pending() {
+  local id=$1 cache=$2 op child
     for op in inbox permission form; do
       if ! api "$cache/$op.json" "session.$op.list" --param sessionID="$id"; then
         echo '{"data":null}' >"$cache/$op.json"
@@ -230,19 +235,31 @@ review_fetch() { # Cache bounded evidence; no model call or session mutation.
         def count: if .data == null then null else (.data | length) end;
         {session: $id, permissions: ($p[0] | count), forms: ($f[0] | count)}' >>"$cache/child-pending.jsonl"
     done < <(jq -r '[.children[] | select(.execution == "running")][0:8][].id' "$cache/row.json")
+    date -Iseconds >"$cache/pending-at"
+}
+
+review_history() {
+    local id=$1 cache=$2 limit=$3
     if ! api "$cache/latest.json" session.message.list --param sessionID="$id" --param type=assistant --param order=desc --param limit="$limit"; then
       echo '{"data":[],"unavailable":true}' >"$cache/latest.json"
     fi
     if ! api "$cache/user.json" session.message.list --param sessionID="$id" --param type=user --param order=desc --param limit=1; then
       echo '{"data":[],"unavailable":true}' >"$cache/user.json"
     fi
+    date -Iseconds >"$cache/history-at"
+}
+
+review_fetch() { # Invocation-local evidence only; no persistent cache or mutation.
+    review_pending "$1" "$2"
+    review_history "$1" "$2" "$3"
 }
 
 review_row() {
     local cache=$1
     q -c -n --slurpfile row "$cache/row.json" --slurpfile a "$cache/latest.json" --slurpfile u "$cache/user.json" \
       --slurpfile models "$TMP/models.json" --slurpfile inbox "$cache/inbox.json" \
-      --slurpfile p "$cache/permission.json" --slurpfile f "$cache/form.json" --slurpfile child "$cache/child-pending.jsonl" "$JQ"'
+      --slurpfile p "$cache/permission.json" --slurpfile f "$cache/form.json" --slurpfile child "$cache/child-pending.jsonl" \
+      --rawfile pending_at "$cache/pending-at" --rawfile history_at "$cache/history-at" "$JQ"'
       def ts: if . == null then "-" else (. / 1000 | floor | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")) end;
       $row[0] as $r | ($a[0].data[0] // {}) as $last
       | ([$a[0].data[] | select((.tokens.input // 0) + (.tokens.cache.read // 0) + (.tokens.cache.write // 0) > 0)][0] // {}) as $step
@@ -251,8 +268,8 @@ review_row() {
       | ($step.tokens // {}) as $t
       | (if $step.tokens then (($t.input // 0) + ($t.cache.read // 0) + ($t.cache.write // 0)) else null end
           | if . != null and . > 0 then . else null end) as $used
-      | (if $r.execution == "unknown" or $p[0].data == null or $f[0].data == null or $inbox[0].data == null or ($child | any(.permissions == null or .forms == null)) then "unknown"
-         elif ($p[0].data | length) + ($f[0].data | length) > 0 or ($child | any(.permissions > 0 or .forms > 0)) then "needs-user"
+      | (if ($p[0].data | length) + ($f[0].data | length) > 0 or ($child | any(.permissions > 0 or .forms > 0)) then "needs-user"
+         elif $r.execution == "unknown" or $p[0].data == null or $f[0].data == null or $inbox[0].data == null or ($child | any(.permissions == null or .forms == null)) then "unknown"
          elif ($inbox[0].data | length) > 0 then "queued"
          elif $r.execution == "running" or ($r.children | any(.execution == "running")) then "running"
          elif (["failed", "stalled", "interrupted"] | index($r.execution)) then "inspect-error"
@@ -260,11 +277,12 @@ review_row() {
          elif ($r.flags | contains("unseen")) then "unseen"
          else "idle-review" end) as $attention
       | $r + {attention: $attention,
+          pending_checked_at: ($pending_at | rtrimstr("\n")), history_checked_at: ($history_at | rtrimstr("\n")),
           last_activity: ($r.last_activity_ms | ts), run_started_at: ($r.run_started_ms | ts),
           user_request: ($u[0].data[0].text // "" | txt(500)),
           reply: ([$said.content[]? | select(.type == "text") | .text] | join(" ") | txt(1200)),
           history_check: (if $a[0].unavailable or $u[0].unavailable then "unavailable" else "bounded latest messages" end),
-          user_request_at: ($u[0].data[0].time.created | ts),
+          user_request_at: ($u[0].data[0].time.created | ts), user_message_id: $u[0].data[0].id,
           reply_at: ($said.time.created | ts), reply_message_id: $said.id, reply_is_final: ($said.finish == "stop"),
           reply_predates_request: (($said.time.created // 0) < ($u[0].data[0].time.created // 0)),
           last_used_model: ($last | model),
@@ -291,7 +309,16 @@ review_row() {
             elif $attention == "running" or $attention == "queued" or $attention == "unanswered" then "unfinished" else "unknown" end),
             basis: "Native pending input/live execution only; interpret current replies separately. Publication alone is not whole-task completion."},
           publication: "not checked; use delivery with a session-attributed branch/commit",
-          cleanup: "not checked",
+          cleanup_gate: {
+            state: (if $r.execution == "running" or ($r.children | any(.execution == "running"))
+                or ($inbox[0].data | length) > 0 or ($p[0].data | length) + ($f[0].data | length) > 0
+                or ($child | any(.permissions > 0 or .forms > 0)) then "blocked"
+              elif $attention == "unknown" or $a[0].unavailable or $u[0].unavailable
+                or $said.finish != "stop" or ($said.time.created // 0) < ($u[0].data[0].time.created // 0)
+                or $r.children_in_window > ($child | length) then "unknown"
+              else "needs-targeted-review" end),
+            basis: "Running/pending evidence can block cleanup; empty counts cannot verify completion. Full child coverage, completion, and applicable delivery still require targeted review."},
+          cleanup: "not verified; never derive archive candidates from execution or publication alone",
           next_action: (if $attention == "needs-user" then "Answer the permission/form in the client"
             elif $attention == "running" then "Leave running; inspect active children if attention is needed"
             elif $attention == "inspect-error" then "Inspect show/tail before proposing continuation"
@@ -303,13 +330,16 @@ review_row() {
 
 review_metadata() {
   local id=$1 cache=$2
-  if ! api "$cache/session.json" session.get --param sessionID="$id"; then
-    jq '.execution="unknown" | .refresh="unavailable"' "$cache/row.json" >"$cache/new-row.json"
+  if ! api "$cache/session.json" session.get --param sessionID="$id" || ! jq -e '.data | type == "object"' "$TMP/review-active.json" >/dev/null; then
+    jq '.execution="unknown" | .refresh="unavailable" | .history_changed=false
+      | .children |= map(.execution="unknown")' "$cache/row.json" >"$cache/new-row.json"
   else
     q --slurpfile row "$cache/row.json" --slurpfile active "$TMP/review-active.json" "$JQ"'
       .data as $s | ($active[0].data // {}) as $active
       | $row[0] + {execution: ($s | state($active)), flags: ($s | flags($active)),
           selected_model: ($s | model), directory: $s.location.directory, subpath: $s.subpath,
+          history_marker: [$s.time.updated, $s.time.busy, $s.time.idle],
+          history_changed: ([$s.time.updated, $s.time.busy, $s.time.idle] != $row[0].history_marker),
           run_started_at: ($s.time.busy | ts), run_started_ms: $s.time.busy,
           last_activity: ([$s | act, $row[0].last_activity_ms] | max | ts),
           last_activity_ms: ([$s | act, $row[0].last_activity_ms] | max), refresh: "refreshed",
@@ -357,42 +387,74 @@ cmd_review() {
     if ! api "$cache/latest.json" session.message.list --param sessionID="$id" --param type=assistant --param order=desc --param limit=8; then
       echo '{"data":[],"unavailable":true}' >"$cache/latest.json"
     fi
+    date -Iseconds >"$cache/history-at"
     review_row "$cache" >>"$TMP/details.jsonl"
   done < <(jq -r '.[]' "$TMP/selected.json")
   # One final bounded refresh, not a poller. Keep incomplete refresh evidence explicit.
-  api "$TMP/review-active.json" session.active || return 1
+  if ! api "$TMP/review-server.json" server.info; then echo 'null' >"$TMP/review-server.json"; fi
+  q -n --slurpfile initial "$TMP/discovery.json" --slurpfile final "$TMP/review-server.json" "$JQ"'
+    $initial[0].server as $before | ($final[0] | server_identity) as $after
+    | {at_scan: $before, at_scan_observed_at: $initial[0].as_of,
+       at_refresh: $after, at_refresh_observed_at: (now | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")),
+       continuity: (if $before == null or $after == null then "unknown"
+         elif $before == $after then "stable" else "changed" end)}' >"$TMP/server-continuity.json"
+  if ! api "$TMP/review-active.json" session.active; then echo '{"data":null}' >"$TMP/review-active.json"; fi
+  date -Iseconds >"$TMP/active-at"
   : >"$TMP/review.jsonl"
   while read -r id; do
     cache="$TMP/$id"
-    if jq -e --arg id "$id" --slurpfile rows "$TMP/details.jsonl" '
+    if jq -e --arg id "$id" --slurpfile rows "$TMP/details.jsonl" --slurpfile server "$TMP/server-continuity.json" '
       .data as $active | $rows[] | select(.id == $id)
-      | .attention != "idle-review" and .attention != "unseen"
+      | $server[0].continuity != "stable" or $active == null
+        or (.attention != "idle-review" and .attention != "unseen")
         or (($active[$id] != null) != (.execution == "running"))
         or any(.children[]; (($active[.id] != null) != (.execution == "running")))
       ' "$TMP/review-active.json" >/dev/null; then
       review_metadata "$id" "$cache"
-      review_fetch "$id" "$cache" 8
+      review_pending "$id" "$cache"
+      if jq -e --slurpfile a "$cache/latest.json" --slurpfile u "$cache/user.json" '
+        .history_changed == true or .execution == "running" or any(.children[]; .execution == "running")
+        or $a[0].unavailable == true or $u[0].unavailable == true' "$cache/row.json" >/dev/null; then
+        review_history "$id" "$cache" 8
+      fi
     fi
     review_row "$cache" >>"$TMP/review.jsonl"
   done < <(jq -r '.[]' "$TMP/selected.json")
   q -n --slurpfile discovery "$TMP/discovery.json" --slurpfile rows "$TMP/review.jsonl" \
-    --slurpfile scan "$TMP/scan.jsonl" --slurpfile selected "$TMP/selected.json" --slurpfile active "$TMP/review-active.json" "$JQ"'
+    --slurpfile scan "$TMP/scan.jsonl" --slurpfile selected "$TMP/selected.json" --slurpfile active "$TMP/review-active.json" \
+    --slurpfile server "$TMP/server-continuity.json" --rawfile active_at "$TMP/active-at" "$JQ"'
+    (($rows | map(. + {evidence_level: "detail"})) + [$scan[]
+      | select(.id as $id | $selected[0] | index($id) | not) | . + {evidence_level: "triage"}]) as $records
+    | if ($records | map(.id) | length) != ($records | map(.id) | unique | length)
+      then error("duplicate session records; cannot produce a consistent review") else
     $discovery[0] | {as_of: (now | strflocaltime("%Y-%m-%d %H:%M:%S %Z %z")), scan_started_at: .as_of,
-      active_count_including_self_and_children: ($active[0].data | length), self_excluded, discovered_roots: .total,
+      server: $server[0], active_checked_at: ($active_at | rtrimstr("\n")),
+      active_count_including_self_and_children: (if $active[0].data == null then null else ($active[0].data | length) end),
+      execution_scope: "Native server snapshot only; not external CLIs, panes, or background OS processes",
+      self_excluded, discovered_roots: .total,
       unresolved_parent_groups,
       blocker_scanned_roots: ($scan | length), unscanned_roots: (.total - ($scan | length)),
       inspected_roots: ($rows | length), scan_capped, refreshed_roots: ([$rows[] | select(.refresh == "refreshed")] | length),
       refresh_failed_roots: ([$rows[] | select(.refresh == "unavailable")] | length),
       omitted_roots: (.total - ($rows | length)),
       coverage: "Bounded triage, then detailed selection and one final refresh. Not atomic. SELF excluded; unscanned sessions and unchecked children are not qualified.",
-      triage: [$scan[] | select(.id as $id | $selected[0] | index($id) | not)
-        | {id, title, directory, execution, attention, user_request: (.user_request | txt(160)),
-           reply: (.reply | txt(400)), reply_message_id, reply_is_final, reply_predates_request, last_activity, last_progress_at, work_status,
+      triage: [$records[] | select(.evidence_level == "triage")
+        | ($server[0].continuity != "stable" or $active[0].data == null) as $stale
+        | {id, project_id, fork_of, title, directory, execution_at_scan: .execution,
+           execution: (if $stale then "unknown" else .execution end),
+           attention: (if $stale then "unknown" else .attention end), evidence_level: "triage",
+           pending_checked_at, history_checked_at, user_message_id, user_request: (.user_request | txt(160)),
+           reply: (.reply | txt(400)), reply_message_id, reply_is_final, reply_predates_request, last_activity, last_progress_at,
+           work_status: (if $stale then {state: "unknown", basis: "Volatile evidence not refreshed"} else .work_status end),
            selected_model, last_used_model,
            context: (.context | {estimate, input_limit, input_percent, capacity, model, measured_at, input_warning}),
            preview_incomplete: (.history_check == "unavailable" or .reply == "" or (.reply | length) > 400),
-           freshness: "Triage snapshot only; not refreshed"}],
-      sessions: ($rows | sort_by((.attention as $a | ["needs-user","unknown","inspect-error","queued","running","unanswered","unseen","idle-review"] | index($a)), -.last_activity_ms))}
+           cleanup_gate: {state: "unknown", basis: "Triage only; no verified archive recommendation"},
+           freshness: (if $stale | not then "Triage snapshot only; not refreshed"
+             else "Server continuity changed or unknown, or active refresh unavailable; execution and pending input require targeted refresh" end)}],
+      sessions: ([$records[] | select(.evidence_level == "detail")]
+        | sort_by((.attention as $a | ["needs-user","unknown","inspect-error","queued","running","unanswered","unseen","idle-review"] | index($a)), -.last_activity_ms))}
+    end
     | walk(if type == "string" then redact else . end)
   '
 }

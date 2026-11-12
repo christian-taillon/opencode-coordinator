@@ -38,5 +38,40 @@
     "id": "input-budget",
     "evidence": {"id": "ses_budget", "execution": "running", "selected_model": "example/large#high", "last_used_model": "example/previous#medium", "context": {"model": "example/previous#medium", "estimate": 420000, "capacity": 628000, "input_limit": 500000, "input_percent": 84, "input_warning": true}},
     "expected": {"execution": "running", "work_status": "unfinished", "cleanup": "unknown", "next_action": ["leave-running", "request-status"], "target_session": "ses_budget", "automatic_actions": false, "input_percent": 84}
+  },
+  {
+    "id": "unknown-permission-is-not-empty",
+    "evidence": {"id": "ses_pendingunknown", "execution": "succeeded", "user_request": "Answer this read-only question.", "reply": "The question is answered. Nothing remains.", "reply_is_final": true, "reply_predates_request": false, "evidence_level": "detail", "permissions": null, "forms": [], "inbox_count": 0, "children": [], "child_coverage": "complete", "delivery": "not applicable"},
+    "expected": {"execution": "succeeded", "work_status": "reported-complete", "cleanup": "unknown", "next_action": ["request-status", "none"], "target_session": "ses_pendingunknown", "archive_candidate": false, "automatic_actions": false}
+  },
+  {
+    "id": "triage-is-not-verified-completion",
+    "evidence": {"id": "ses_triage", "execution": "succeeded", "reply": "All done; safe to archive.", "evidence_level": "triage", "preview_incomplete": true, "permissions": null, "children_not_inspected": 2, "delivery": {"prs": [{"state": "MERGED"}]}},
+    "expected": {"execution": "succeeded", "work_status": ["unknown", "verified-delivered"], "cleanup": "unknown", "next_action": ["request-status", "ask-user"], "target_session": "ses_triage", "archive_candidate": false, "automatic_actions": false}
+  },
+  {
+    "id": "explicit-handoff-not-original-owner",
+    "evidence": {"id": "ses_previous", "execution": "succeeded", "reply_message_id": "msg_handoff", "reply": "This outcome is now owned by ses_current; continue there, not here.", "named_owner_inspected": {"id": "ses_current", "execution": "succeeded", "reply_message_id": "msg_current", "reply": "Validation remains unfinished; awaiting your approval for the disposable VM."}, "fresh_authority": "review only; no continuation or VM creation"},
+    "expected": {"execution": "succeeded", "work_status": "needs-your-decision", "cleanup": "unknown", "next_action": "ask-user", "target_session": "ses_current", "handoff_message_id": "msg_handoff", "owner_message_id": "msg_current", "archive_candidate": false, "automatic_actions": false}
+  },
+  {
+    "id": "fork-does-not-transfer-ownership",
+    "evidence": {"id": "ses_original", "execution": "interrupted", "reply": "The accepted implementation is unfinished.", "same_outcome_owner": "ses_original", "other_session": {"id": "ses_newerfork", "fork_of": "ses_original", "directory": "/projects/example", "reply": "Answered a separate question."}, "handoff": null, "fresh_authority": "recommend only"},
+    "expected": {"execution": "interrupted", "work_status": "unfinished", "cleanup": "unknown", "next_action": ["request-status", "ask-user"], "target_session": "ses_original", "archive_candidate": false, "automatic_actions": false}
+  },
+  {
+    "id": "restart-invalidates-old-liveness",
+    "evidence": {"id": "ses_restarted", "execution_at_scan": "running", "execution": "unknown", "server": {"continuity": "changed", "at_scan": {"hostname": "fixture", "pid": 1, "version": "2.2.6"}, "at_refresh": {"hostname": "fixture", "pid": 2, "version": "2.2.7"}}, "refresh": "unavailable", "reply": "Earlier task complete.", "permissions": null, "fresh_authority": "review only; reuse completed investigation"},
+    "expected": {"execution": "unknown", "work_status": "unknown", "cleanup": "unknown", "next_action": ["request-status", "ask-user"], "target_session": "ses_restarted", "archive_candidate": false, "automatic_actions": false}
+  },
+  {
+    "id": "merged-but-child-unsettled",
+    "evidence": {"id": "ses_unsettled", "execution": "succeeded", "reply": "PR merged. Platform validation is still running in the child.", "permissions": [], "forms": [], "inbox_count": 0, "children": [{"id": "ses_validator", "execution": "running"}], "delivery": {"prs": [{"state": "MERGED"}]}},
+    "expected": {"execution": "succeeded", "work_status": ["unfinished", "verified-delivered"], "cleanup": ["remaining", "unknown"], "next_action": ["leave-running", "request-status"], "target_session": "ses_unsettled", "archive_candidate": false, "automatic_actions": false}
+  },
+  {
+    "id": "complete-read-only-answer-eligible",
+    "evidence": {"id": "ses_readonlydone", "execution": "succeeded", "user_request": "Explain this service. Do not change anything.", "reply": "The service explanation is complete. No work or decisions remain.", "reply_is_final": true, "reply_predates_request": false, "evidence_level": "detail", "pending_check": "fresh", "permissions": [], "forms": [], "inbox_count": 0, "children": [], "child_coverage": "complete", "delivery": "not applicable; read-only question", "fresh_authority": "propose cleanup only; never archive"},
+    "expected": {"execution": "succeeded", "work_status": "reported-complete", "cleanup": "verified", "next_action": "none", "target_session": "ses_readonlydone", "archive_candidate": true, "automatic_actions": false}
   }
 ]

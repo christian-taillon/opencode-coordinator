@@ -35,7 +35,9 @@ def main():
         print("token=fixture-failure-secret", file=sys.stderr)
         sys.exit(1)
     if operation == "server.info":
-        result = {"hostname": "fixture-host", "version": "2.2.5", "pid": 1}
+        result = state.get(
+            "server_info", {"hostname": "fixture-host", "version": "2.2.5", "pid": 1}
+        )
     elif operation == "session.active":
         result = {"data": state["active"]}
     elif operation == "session.list":

@@ -165,6 +165,19 @@ replies, context estimates and attributed Git/remote evidence only as requested.
 See the [lazy skill](skills/session-coordination/SKILL.md) for procedures. A
 successful run is not whole-task completion; missing evidence stays unknown.
 
+Detailed review records server identity at scan/refresh, input/history timestamps,
+evidence level and a conservative cleanup gate. A restart refreshes selected
+native execution/input evidence; unchanged terminal history is reused while
+running progress is refreshed. Unrefreshed triage is not current truth after a
+server change. To continue an interrupted review,
+reuse timestamped investigation and `show EXACT_ID` only for affected sessions.
+
+Reports use one record per exact ID, grouped by project, with separate execution,
+work, delivery and cleanup evidence. Only targeted completion, pending-input,
+settled-child and applicable Git/PR checks qualify a verified archive proposal;
+triage and a merged PR alone do not. Explicit owner handoffs need a source message
+and inspection of the recipient; fork ancestry or a shared directory is not one.
+
 `cleanup-plan --project TEXT --max 10 [--offset N]` checks pending-input counts
 for a bounded native batch and up to eight known children per root. It reports
 remaining coverage; errors are unknown, never empty. Completion, other children
